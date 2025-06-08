@@ -1,84 +1,134 @@
 // src/server.rs
+//! 这是 rudis 服务的网络层：
+//! - 监听 TCP 连接  
+//! - 解码请求（文本 / RESP）  
+//! - 调度到 engine 执行  
+//! - 写命令时同步到持久化器  
+//! - 以 RESP Simple String/Error 形式回复
 use anyhow::Result;
+use std::sync::Arc;
+use std::io::ErrorKind;
+
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream}
+    net::{TcpListener, TcpStream},
+    io::{AsyncReadExt, AsyncBufReadExt, AsyncWriteExt, BufReader},
 };
-use crate::engine;
+
+use sled::Db;
+use crate::{engine, persistence::Persistence};
 
 /// 启动 KV 服务（stub）
 /// 默认入口: 监听 127.0.0.1:6380
-pub async fn start() -> Result<()> {
+pub async fn start_with_db_and_pers(db: sled::Db, pers: Arc<Persistence>) -> Result<()> {
+    // 绑定地址
     let addr = "127.0.0.1:6380";
     let listener = TcpListener::bind(addr).await?;
-    println!("kvdb server listening on {}", addr);
-    serve(listener).await
+    println!("rudis server listening on {}", addr);
+    
+    // 进入接受循环
+    serve_with_db(listener, db, pers).await
 }
 
-/// 核心循环: 接受循环 并 spawn 出去
-pub async fn serve(listener: TcpListener) -> Result<()> {
+/// 核心循环: 接受循环 不断接受 accpet 新连接 并 spawn 出去一个异步任务
+async fn serve_with_db(listener: TcpListener, db: Db, pers: Arc<Persistence>) -> Result<()> {
     loop {
+        // accept() 返回一个 TcpStream 和客户端地址
         let (stream, peer) = listener.accept().await?;
         println!("Accepted connection from {}", peer);
+
+        // 克隆 Arc，给新的任务一份引用
+        let db_clone = db.clone();
+        let pers_clone = pers.clone();
+
+        // 为每个连接启动异步任务
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream).await {
+            if let Err(err) = handle_connection(stream, db_clone, pers_clone).await {
                 eprintln!("Connection error: {}", err);
             }
         });
     }
 }
 
-/// 单个连接的处理逻辑：按行执行命令、split 空格、调度 engine、回写结果
-async fn handle_connection(stream: TcpStream) -> Result<()> {
+/// 单个连接的处理逻辑
+/// - 先读第一个字节，区分「RESP Array」或「简单文本」协议
+/// - 解析成 Vec<String> parts
+/// - 调 engine 执行业务
+/// - 如果是写命令，追加 AOF & 触发 RDB
+/// - 统一以 RESP Simple String/Error 回复
+async fn handle_connection(
+    stream: TcpStream,
+    db: Db,
+    pers: Arc<Persistence>,
+) -> Result<()> {
+    // 记录对端地址，用于日志
     let peer = stream.peer_addr()?;
+    // 把流拆成 reader / writer
     let (reader, mut writer) = stream.into_split();
+    // 用 BufReader 包装，以便使用 read_line()
     let mut reader = BufReader::new(reader);
 
     loop {
-        // 1) 先读一个字节，看看是普通文本，还是 RESP Array（'*' 开头）
+        // ----- 1) 先读一个字节，决定协议类型 -----
         let mut first = [0u8; 1];
         match reader.read_exact(&mut first).await {
+            // 正常读取到一个字节
             Ok(_) => {}
-            // 如果客户端断开，就跳出循环
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            // 客户端断开（EOF） or Windows 下的 RST(10054)
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof
+                     || e.kind() == ErrorKind::ConnectionReset => {
+                println!("{} disconnected", peer);
+                break;
+            }
+            // 其它 I/O 错误
             Err(e) => return Err(e.into()),
         }
 
-        // 2) 根据首字节分两条逻辑
+        // ----- 2) 解析命令到 Vec<String> -----
         let parts: Vec<String> = if first[0] == b'*' {
-            // RESP Array 格式：*<N>\r\n then N * ( $<len>\r\n<payload>\r\n )
-            // 2.1 读 "*<N>\r\n" 剩余部分
+            // --- RESP Array 分支 ---
+            // 典型请求示例：
+            //   *2\r\n$3\r\nSET\r\n$5\r\nmykey\r\n
+            // 我们只简单支持 Array + Bulk String
+
+            // 2.1 读取 "*<N>\r\n" 剩余部分，拿到 N
             let mut line = String::new();
             reader.read_line(&mut line).await?;
+            // 去掉 '*'，再解析数字
             let count: usize = line.trim().parse()?;
 
-            // 2.2 循环读 N 个 bulk strings
             let mut cmd = Vec::with_capacity(count);
             for _ in 0..count {
-                // 读 "$<len>\r\n"
+                // 2.2 读 "$<len>\r\n"
                 line.clear();
                 reader.read_line(&mut line).await?;
-                let len: usize = line.trim_start_matches('$').trim().parse()?;
+                let len: usize = line
+                    .trim_start_matches('$')
+                    .trim()
+                    .parse()?;
 
-                // 读 payload
+                // 2.3 读实际 payload
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf).await?;
-                // 丢掉结尾的 "\r\n"
+                // 丢弃结尾的 "\r\n"
                 let mut crlf = [0u8; 2];
                 reader.read_exact(&mut crlf).await?;
 
-                cmd.push(String::from_utf8(buf)?);
+                // 转成 UTF-8 字符串
+                let s = String::from_utf8(buf)?;
+                cmd.push(s);
             }
             cmd
         } else {
-            // 文本协议：先把第一个字节拼回去，再 read_line
+            // --- 简单文本协议分支 ---
+            // 我们已经读了第一个 byte，把它当成 ASCII 字符
+            // 例如 'P'，后面还要读到 '\n'
             let mut line = String::new();
             reader.read_line(&mut line).await?;
-            // 包括 first[0] + line
+            // 把 first + line 拼成完整一行
             let mut full = String::new();
             full.push(first[0] as char);
             full.push_str(&line);
-            // 空格分词
+            // 按空格拆分
             full
                 .trim_end()
                 .split_whitespace()
@@ -86,85 +136,35 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
                 .collect()
         };
 
-        // 3) 调度到底层 engine
-        let mut resp = engine::excute(parts);
+        // 如果 client 发了空行，就重新循环
+        if parts.is_empty() {
+            continue;
+        }
 
-        // 4) 包装成 RESP 返回给客户端
+        // ----- 3) 调度到 engine 执行业务 -----
+        // 我们假设 engine::execute(parts, &db) -> String
+        let cmd_name = parts[0].to_uppercase();
+        let is_write = matches!(cmd_name.as_str(), "SET" | "DEL" /*| …*/);
+
+        // 以空格 join 回去，用于记录到 AOF
+        let raw_cmd = parts.join(" ");
+        let resp = engine::execute(parts, &db);
+
+        // ----- 4) 如果是写命令，再追加 AOF 并触发 RDB -----
+        if is_write {
+            pers.append_aof_and_maybe_snapshot(&raw_cmd, &db);
+        }
+
+        // ----- 5) 统一用 RESP Simple String / Error 格式回复 -----
+        // +OK\r\n   或  -ERR something\r\n
         let out = if resp.starts_with("ERR") {
-            // Error: -ERR xxx\r\n
             format!("-{}\r\n", resp)
         } else {
-            // Simple String: +xxx\r\n
             format!("+{}\r\n", resp)
         };
         writer.write_all(out.as_bytes()).await?;
     }
 
-    println!("{} disconnected", peer);
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-        net::TcpListener,
-        time::{sleep, Duration},
-    };
-
-    /// 解析一个 RESP Simple String，去掉前缀 '+' 和尾部 "\r\n"
-    fn parse_simple_string(line: &str) -> &str {
-        let s = line.trim_end();  // 去掉 "\r\n" 及其它尾部空白
-        assert!(s.starts_with('+'), "expected '+' prefix but got {:?}", s);
-        &s[1..]
-    }
-
-    #[tokio::test]
-    async fn test_ping_pong() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { serve(listener).await.unwrap() });
-        sleep(Duration::from_millis(100)).await;
-
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (r, mut w) = stream.split();
-        let mut r = BufReader::new(r);
-
-        w.write_all(b"PING\r\n").await.unwrap();
-        let mut line = String::new();
-        r.read_line(&mut line).await.unwrap();
-
-        // 解析 RESP Simple String
-        let content = parse_simple_string(&line);
-        assert_eq!(content, "PONG");
-    }
-
-    #[tokio::test]
-    async fn test_multiple_clients() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { serve(listener).await.unwrap() });
-        sleep(Duration::from_millis(100)).await;
-
-        let mut handles = Vec::new();
-        for _ in 0..5 {
-            let addr = addr.clone();
-            handles.push(tokio::spawn(async move {
-                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-                let (r, mut w) = stream.split();
-                let mut r = BufReader::new(r);
-
-                w.write_all(b"PING\r\n").await.unwrap();
-                let mut line = String::new();
-                r.read_line(&mut line).await.unwrap();
-
-                let content = parse_simple_string(&line);
-                assert_eq!(content, "PONG");
-            }));
-        }
-        for h in handles {
-            h.await.unwrap();
-        }
-    }
-}

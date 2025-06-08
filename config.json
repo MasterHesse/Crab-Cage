@@ -1,0 +1,6 @@
+{
+  "aof": true,                  
+  "rdb": true,                  
+  "snapshot_interval_secs": 60, 
+  "snapshot_threshold": 1000    
+}

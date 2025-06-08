@@ -1,9 +1,13 @@
 [package]
-name = "kvdb"
+name = "rudis"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio   = { version = "1", features = ["full"] }
-anyhow  = "1.0"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
 sled = "0.34"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+tempfile = "3"
