@@ -1,4 +1,4 @@
-./target
-./kv.db
-./appendonly.aof
-./dump.rdb
+target
+kv.db
+appendonly.aof
+dump.rdb
