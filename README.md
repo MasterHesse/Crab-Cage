@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/rudis)](https://crates.io/crates/rudis) [![Rust](https://img.shields.io/badge/rust-1.70+-orange)](https://www.rust-lang.org/) [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE)
 
-一个用 Rust 实现的**个人学习版 Redis-like 分布式缓存**。
+一个用 Rust 实现的，个人学习版的 Redis-like 内存数据缓存。
 
 ---
 
@@ -16,7 +16,8 @@
   - [快速开始](#快速开始)
     - [前提](#前提)
     - [构建与运行](#构建与运行)
-  - [使用示例](#使用示例)
+    - [使用示例](#使用示例)
+  - [命令支持一览](#命令支持一览)
   - [贡献](#贡献)
   - [许可证](#许可证)
 
@@ -24,40 +25,29 @@
 
 ## 什么是 rudis?
 
-`rudis` 是一个用 Rust 从零实现的轻量级、个人学习性质的内存数据缓存，支持 Redis 协议（RESP）、AOF 持久化，以及简单的分片分布。
-
-> **注意**：本项目仅用于学习和实验，不适合生产环境。  
-> 探索内容包括：
-> - Rust 异步生态（Tokio、async/await）  
-> - RESP 协议解析与序列化  
-> - 内存数据结构（String、List、Hash、Set）  
-> - AOF 持久化与恢复  
-> - 基础分片分布式缓存  
+`rudis` 是一个用 Rust 从零实现的轻量级、个人学习性质的内存数据缓存，兼容 Redis 协议（RESP），支持持久化（AOF/RDB）、多种数据类型与简易分片。仅供学习与实验，不适合生产环境。
 
 ---
 
 ## 为什么开发 rudis?
 
-- **学习 Rust & Tokio**  
-  个人为了深入实践所有权、`async/await`、零拷贝等Rust核心特性。  
-- **理解 Redis 内部**  
-  手写 RESP 解析器、命令调度、数据类型实现。  
-- **探索持久化**  
-  实现 AOF 持久化、启动时重放、文件滚动等。  
-- **尝试分布式**  
-  构建简单的哈希槽分片层，掌握分布式缓存基本原理。  
+- 深入实践 Rust 核心特性：所有权、借用、异步（Tokio/async-await）、零拷贝等  
+- 理解 Redis 内部实现：RESP 解析、命令分发、数据结构、持久化与恢复  
+- 探索分布式缓存基础：哈希槽分片、多实例部署  
 
 ---
 
 ## 特性
 
-- RESP 协议 TCP 服务器（默认端口 6380，防止与Redis默认端口冲突）  
-- 支持命令：  
-  - 字符串：`GET`, `SET`, `DEL`, `INCR`  
-- AOF 持久化与重放  
-- RDB 持久化与重放 
-- 简易分片：将键映射到不同节点  
-- 零外部依赖（除 Tokio、env_logger、serde 等）  
+- RESP 协议 TCP 服务器（默认端口 **6380**，避免与 Redis 冲突）  
+- 多种数据类型：  
+  - String: `GET`、`SET`、`DEL` 
+  - Hash:  `HSET`、`HGET`、`HDEL`、`HKEYS`、`HVALS`、`HGETALL`  
+  - List:  `LPUSH`、`RPUSH`、`LPOP`、`RPOP`、`LRANGE`  
+  - Set:   `SADD`、`SREM`、`SMEMBERS`、`SISMEMBER`  
+- 持久化：AOF（Append-Only File）与 RDB（快照）  
+- 简易分片部署（正在开发）  
+- 零外部依赖（除 Tokio、serde、sled 等）  
 
 ---
 
@@ -74,50 +64,93 @@
 ```bash
 git clone https://github.com/MasterHesse/rudis.git
 cd rudis
+
+# Release 模式构建并启动
 cargo build --release
+cargo run --release
 ```
 
-创建配置文件（参考 `examples/config.toml`），然后：
+默认监听 `127.0.0.1:6380`，持久化文件 `appendonly.aof`/`dump.rdb`。
+
+### 使用示例
 
 ```bash
-# 单节点启动
-cargo run --release
+# 建议另开终端，用 redis-cli 测试
+redis-cli -p 6380
 
-# 多节点分片还在开发中
+# --- String ---
+> SET user:1 Alice
+OK
+> GET user:1
+Alice
+> DEL user:1
+OK
+> GET user:1
+ERR key not found
+
+# --- Hash ---
+> HSET profile name Alice
+1
+> HSET profile age 30
+1
+> HGET profile name
+Alice
+> HKEYS profile
+name,age
+> HVALS profile
+Alice,30
+> HGETALL profile
+name,Alice,age,30
+
+# --- List ---
+> LPUSH mylist a
+1
+> LPUSH mylist b
+2       # 列表现在 [b, a]
+> RPUSH mylist c
+3       # 列表现在 [b, a, c]
+> LRANGE mylist 0 -1
+b,a,c
+> LPOP mylist
+b
+> RPOP mylist
+c
+
+# --- Set ---
+> SADD myset x
+1
+> SADD myset y
+1
+> SADD myset x
+0       # x 已存在
+> SMEMBERS myset
+x,y
+> SISMEMBER myset y
+1
+> SREM myset x
+1
 ```
 
 ---
 
-## 使用示例
+## 命令支持一览
 
-使用 `redis-cli` 连接（默认端口 6380）：
-
-```bash
-redis-cli -p 6380
-> SET user:1 "Alice"
-OK
-> GET user:1
-"Alice"
-> DEL user:1
-OK
-> GET user:1
-(error) ERR key not found
-```
+| 类型   | 命令                                      |
+|------|-----------------------------------------   |
+| String | GET, SET, DEL                            |
+| Hash   | HSET, HGET, HDEL, HKEYS, HVALS, HGETALL  |
+| List   | LPUSH, RPUSH, LPOP, RPOP, LRANGE         |
+| Set    | SADD, SREM, SMEMBERS, SISMEMBER          |
 
 ---
 
 ## 贡献
 
-本项目以学习为主，但欢迎：
-
-- 提交 Issue 讨论问题或需求  
-- Fork 并提交 PR 改进功能  
-- 分享新的实验想法与实践经验  
-
-请保持项目的学习性质：优先简单可理解的实现。
+非常欢迎 Issue、PR 与讨论。  
+本项目以学习为主，优先「简单、可读」的实现。
 
 ---
 
 ## 许可证
 
-本项目采用 **MIT** 或 **Apache-2.0** 双重许可。详见 [LICENSE](LICENSE) 文件。  
+双重许可证：MIT 或 Apache-2.0，详见 [LICENSE](LICENSE) 文件。  
