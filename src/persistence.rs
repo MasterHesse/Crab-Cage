@@ -1,57 +1,76 @@
+// src/persistence.rs
+
 use anyhow::Result;
 use sled::Db;
 use std::{
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Write},
-    path::Path,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    thread,
-    time::Duration,
+    thread, time::Duration,
 };
-
 use crate::config::Config;
 
-/// 持久化模块：负责 AOF 日志 和 RDB 快照
+/// 持久化器：AOF 日志 + RDB 快照
 pub struct Persistence {
-    cfg: Config,
-    // AOF 文件的写入器（带缓冲），进程退出时要 fsync
-    aof_writer: Option<Arc<std::sync::Mutex<File>>>, 
-    // 已执行的写命令数，用于触发 RDB
-    write_count: AtomicU64, 
+    cfg:     Config,
+    db:      Db,
+    aof_path: PathBuf,
+    rdb_path: PathBuf,
+    aof_writer: Option<Arc<Mutex<File>>>,
+    write_count: AtomicU64,
 }
 
 impl Persistence {
-    /// 构造：打开 AOF (append) ，并根据 config 启动快照线程
-    pub fn new(cfg: Config, db:Db) -> Result<Arc<Self>> {
-        // 1) 如果开启 AOF ，就打开或新建 appendonly.aof
+    /// 兼容单节点的老 API
+    pub fn new(cfg: Config, db: Db) -> Result<Arc<Self>> {
+        // 调用 new_with_paths，使用默认路径
+        Self::new_with_paths(
+            cfg,
+            db,
+            PathBuf::from("appendonly.aof"),
+            PathBuf::from("dump.rdb"),
+        )
+    }
+
+    /// 新 API：指定 AOF/RDB 文件路径
+    pub fn new_with_paths(
+        cfg: Config,
+        db: Db,
+        aof_path: PathBuf,
+        rdb_path: PathBuf,
+    ) -> Result<Arc<Self>> {
+        // 打开或创建 AOF
         let aof_writer = if cfg.aof {
             let f = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("appendonly.aof")?;
-            Some(Arc::new(std::sync::Mutex::new(f)))
+                .open(&aof_path)?;
+            Some(Arc::new(Mutex::new(f)))
         } else {
             None
         };
 
         let pers = Arc::new(Self {
             cfg: cfg.clone(),
+            db: db.clone(),
+            aof_path,
+            rdb_path: rdb_path.clone(),
             aof_writer,
             write_count: AtomicU64::new(0),
         });
 
-        // 2) 如果开启 RDB ，启动 RDB 快照线程
+        // RDB 快照线程
         if cfg.rdb {
-            let pers_cloned = pers.clone();
-            // 使用本身并发安全的 sled auto-flush
+            let p = pers.clone();
             thread::spawn(move || {
                 let interval = Duration::from_secs(cfg.snapshot_interval_secs);
                 loop {
                     thread::sleep(interval);
-                    if let Err(e) = pers_cloned.do_snapshot(&db) {
+                    if let Err(e) = p.do_snapshot() {
                         eprintln!("RDB snapshot failed: {}", e);
                     }
                 }
@@ -61,85 +80,79 @@ impl Persistence {
         Ok(pers)
     }
 
-    /// 启动时：读取并重放 AOF
-    pub fn load_aof(&self, db: &Db) -> Result<()> {
-        if let Some(_) = &self.aof_writer {
-            if Path::new("appendonly.aof").exists() {
-                let f = File::open("appendonly.aof")?;
-                let reader = BufReader::new(f);
-                for line in reader.lines() {
-                    let line = line?;
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.is_empty() {continue;}
-                    // 简单只支持 SET k v / DEL k
-                    match parts[0].to_uppercase().as_str() {
-                        "SET" if parts.len() == 3 => {db.insert(parts[1], parts[2].as_bytes())?;}
-                        "DEL" if parts.len() == 2 => {db.remove(parts[1])?;}
-                        _ => { /* 忽略不支持的语句 */ }
+    /// 启动时重放 AOF
+    pub fn load_aof(&self) -> Result<()> {
+        if self.aof_writer.is_some() && self.aof_path.exists() {
+            let f = File::open(&self.aof_path)?;
+            let reader = BufReader::new(f);
+            for line in reader.lines() {
+                let line = line?;
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.is_empty() { continue; }
+                match parts[0].to_uppercase().as_str() {
+                    "SET" if parts.len() == 3 => {
+                        self.db.insert(parts[1], parts[2].as_bytes())?;
                     }
+                    "DEL" if parts.len() == 2 => {
+                        self.db.remove(parts[1])?;
+                    }
+                    _ => {}
                 }
-                // sled写操作完成，显式 flush 持久化到本地
-                db.flush()?;
             }
+            self.db.flush()?;
         }
         Ok(())
     }
 
-    /// 每次写命令执行后调用：追加一行到 AOF ，并根据阈值触发一次快照
-    pub fn append_aof_and_maybe_snapshot(&self, raw_cmd: &str, db:&Db) {
-        // AOF
+    /// 写命令后追加 AOF 并触发 RDB
+    pub fn append_aof_and_maybe_snapshot(&self, raw: &str, _db: &Db) {
         if let Some(w) = &self.aof_writer {
-            let mut guard = w.lock().unwrap();
-            let _ = writeln!(guard, "{}", raw_cmd);
+            let mut f = w.lock().unwrap();
+            let _ = writeln!(f, "{}", raw);
         }
-
-        // RDB by count
         if self.cfg.rdb {
             let prev = self.write_count.fetch_add(1, Ordering::SeqCst);
             if prev + 1 >= self.cfg.snapshot_threshold {
-                //  重置计数
                 self.write_count.store(0, Ordering::SeqCst);
-                // 立即快照
-                if let Err(e) = self.do_snapshot(db) {
+                if let Err(e) = self.do_snapshot() {
                     eprintln!("RDB snapshot failed: {}", e);
                 }
             }
         }
     }
 
-    /// 真正执行一次全量 RDB 快照，遍历sled，把 KV 序列化到临时文件，再原子命名
-    fn do_snapshot(&self, db:&Db) -> Result<()> {
-        // 1) 先把 sled 数据写入磁盘
-        db.flush()?;
+    /// 执行一次全量 RDB 快照
+    fn do_snapshot(&self) -> Result<()> {
+        // 确保 sled 数据落盘
+        self.db.flush()?;
 
-        // 2) 打开临时文件
-        let tmp = "dump.rdb.tmp";
-        let mut f = File::create(tmp)?;
-
-        // 3) 迭代 sled 所有 KV
-        for item in db.iter() {
-           let (k,v) = item?;
-            // 格式：<key_len> <value_len> <key_bytes> <value_bytes>\n
-            writeln!(f, "{} {} {} {}",
+        // 写入临时文件
+        let tmp = self.rdb_path.with_extension("tmp");
+        let mut f = File::create(&tmp)?;
+        for item in self.db.iter() {
+            let (k, v) = item?;
+            writeln!(
+                f,
+                "{} {} {} {}",
                 k.len(),
                 v.len(),
                 hex::encode(&k),
-                hex::encode(&v),
+                hex::encode(&v)
             )?;
         }
-        f.sync_all()?; // 确保写入磁盘
+        f.sync_all()?;
 
-        // 4) 原子替换
-        std::fs::rename(tmp, "dump.rdb")?;
+        // 原子替换
+        std::fs::rename(tmp, &self.rdb_path)?;
         Ok(())
     }
 
-    /// 退出时 fsync AOF
+    /// 优雅关闭时调用，强制 fsync AOF
     pub fn fsync_and_close(&self) {
         if let Some(w) = &self.aof_writer {
-            if let Ok(mut guard) = w.lock() {
-                let _ = guard.sync_all();
+            if let Ok(mut f) = w.lock() {
+                let _ = f.sync_all();
             }
         }
-    }  
+    }
 }
