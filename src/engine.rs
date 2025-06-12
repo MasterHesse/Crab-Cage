@@ -6,6 +6,7 @@
 //! - 返回一个 String 作为响应，供上层网络层封装成 RESP Simple String 或 Error
 
 use sled::Db; // sled 的数据库类型
+use crate::types::{hash, list, set}; // 支持多种数据类型
 
 /// 核心执行函数
 ///
@@ -23,6 +24,7 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
     let cmd = parts[0].to_uppercase();
 
     match cmd.as_str() {
+        // --- String 原有命令 ---
         "PING" => {
             // PING: 最简单的心跳，返回 PONG
             "PONG".to_string()
@@ -99,6 +101,119 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
             }
         }
 
+        // --- Hash 命令 ---
+        "HSET" => {
+            if parts.len() != 4 {
+                "ERR wrong number of arguments for 'HSET'".into()
+            } else {
+                match hash::hset(db, &parts[1], &parts[2], &parts[3]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
+                }
+            }
+        }
+        "HGET" => {
+            if parts.len() != 3 {
+                "ERR wrong number of arguments for 'HGET'".into()
+            } else {
+                match hash::hget(db, &parts[1], &parts[2]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
+                }
+            }
+        }
+        "HDEL" => {
+            if parts.len() != 3 {
+                "ERR wrong number of arguments for 'HDEL'".into()
+            } else {
+                match hash::hdel(db, &parts[1], &parts[2]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
+                }
+            }
+        }
+        "HKEYS" => {
+            if parts.len() != 2 {
+                "ERR wrong number of arguments for 'HKEYS'".into()
+            } else {
+                match hash::hkeys(db, &parts[1]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
+                }
+            }
+        }
+        "HVALS" => {
+            if parts.len() != 2 {
+                "ERR wrong number of arguments for 'HVALS'".into()
+            } else {
+                match hash::hvals(db, &parts[1]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
+                }
+            }
+        }
+        "HGETALL" => {
+            if parts.len() != 2 {
+                "ERR wrong number of arguments for 'HGETALL'".into()
+            } else {
+                match hash::hgetall(db, &parts[1]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
+                }
+            }
+        }
+
+        // --- List 命令 ---
+        "LPUSH" => {
+            if parts.len() != 3 { "ERR wrong number of arguments for 'LPUSH'".into() }
+            else { match list::lpush(db, &parts[1], &parts[2]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+        }
+        "RPUSH" => {
+            if parts.len() != 3 { "ERR wrong number of arguments for 'RPUSH'".into() }
+            else { match list::rpush(db, &parts[1], &parts[2]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+        }
+        "LPOP" => {
+            if parts.len() != 2 { "ERR wrong number of arguments for 'LPOP'".into() }
+            else { match list::lpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+        }
+        "RPOP" => {
+            if parts.len() != 2 { "ERR wrong number of arguments for 'RPOP'".into() }
+            else { match list::rpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+        }
+        "LRANGE" => {
+            if parts.len() != 4 { "ERR wrong number of arguments for 'LRANGE'".into() }
+            else {
+                let start = parts[2].parse::<isize>();
+                let stop  = parts[3].parse::<isize>();
+                match (start, stop) {
+                    (Ok(s), Ok(e)) => match list::lrange(db, &parts[1], s, e) {
+                        Ok(r) => r,
+                        Err(er) => format!("ERR {}", er),
+                    },
+                    _ => "ERR invalid start or stop".into(),
+                }
+            }
+        }
+
+        // --- Set 命令 ---
+        "SADD" => {
+            if parts.len() != 3 { "ERR wrong number of arguments for 'SADD'".into() }
+            else { match set::sadd(db, &parts[1], &parts[2]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+        }
+        "SREM" => {
+            if parts.len() != 3 { "ERR wrong number of arguments for 'SREM'".into() }
+            else { match set::srem(db, &parts[1], &parts[2]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+        }
+        "SMEMBERS" => {
+            if parts.len() != 2 { "ERR wrong number of arguments for 'SMEMBERS'".into() }
+            else { match set::smembers(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+        }
+        "SISMEMBER" => {
+            if parts.len() != 3 { "ERR wrong number of arguments for 'SISMEMBER'".into() }
+            else { match set::sismember(db, &parts[1], &parts[2]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+        }
+
+        // 其他命令
         "QUIT" => {
             // 客户端主动断开可能会发 QUIT
             // 返回 OK，由 server 层决定断开循环

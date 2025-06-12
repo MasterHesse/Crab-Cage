@@ -6,6 +6,7 @@ mod config;
 mod persistence;
 mod server;
 mod engine;
+mod types;
 
 use config::load;
 use persistence::Persistence;
