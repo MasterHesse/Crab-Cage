@@ -3,7 +3,7 @@
 //! List 类型：每个 key 对应一个 sled::Tree "list:<key>"，
 //! 用“偏移翻转”后的 i64 BE bytes 做索引，支持双端队列。
 
-use sled::{Db, IVec, Tree};
+use sled::{Db, Tree};
 use anyhow::Result;
 use std::str;
 

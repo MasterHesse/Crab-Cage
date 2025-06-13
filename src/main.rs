@@ -7,6 +7,7 @@ mod persistence;
 mod server;
 mod engine;
 mod types;
+mod expire;
 
 use config::load;
 use persistence::Persistence;

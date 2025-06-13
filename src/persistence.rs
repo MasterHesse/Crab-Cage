@@ -12,7 +12,7 @@ use std::{
     },
     thread, time::Duration,
 };
-use crate::config::Config;
+use crate::{config::Config, engine};
 
 /// 持久化器：AOF 日志 + RDB 快照
 pub struct Persistence {
@@ -25,17 +25,6 @@ pub struct Persistence {
 }
 
 impl Persistence {
-    /// 兼容单节点的老 API
-    pub fn new(cfg: Config, db: Db) -> Result<Arc<Self>> {
-        // 调用 new_with_paths，使用默认路径
-        Self::new_with_paths(
-            cfg,
-            db,
-            PathBuf::from("appendonly.aof"),
-            PathBuf::from("dump.rdb"),
-        )
-    }
-
     /// 新 API：指定 AOF/RDB 文件路径
     pub fn new_with_paths(
         cfg: Config,
@@ -89,15 +78,14 @@ impl Persistence {
                 let line = line?;
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.is_empty() { continue; }
-                match parts[0].to_uppercase().as_str() {
-                    "SET" if parts.len() == 3 => {
-                        self.db.insert(parts[1], parts[2].as_bytes())?;
-                    }
-                    "DEL" if parts.len() == 2 => {
-                        self.db.remove(parts[1])?;
-                    }
-                    _ => {}
+                // split_whitespace 并收集为 Vec<String>
+                let parts: Vec<String> =
+                    line.split_whitespace().map(|s| s.to_string()).collect();
+                if parts.is_empty() {
+                    continue;
                 }
+                // 调用 engine 执行业务命令（包括 SET/DEL/EXPIRE/..）
+                let _ = engine::execute(parts, &self.db);
             }
             self.db.flush()?;
         }
@@ -150,7 +138,7 @@ impl Persistence {
     /// 优雅关闭时调用，强制 fsync AOF
     pub fn fsync_and_close(&self) {
         if let Some(w) = &self.aof_writer {
-            if let Ok(mut f) = w.lock() {
+            if let Ok(f) = w.lock() {
                 let _ = f.sync_all();
             }
         }

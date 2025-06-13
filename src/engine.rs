@@ -7,7 +7,7 @@
 
 use sled::Db; // sled 的数据库类型
 use crate::types::{hash, list, set}; // 支持多种数据类型
-
+use crate::expire;
 /// 核心执行函数
 ///
 /// parts: 客户端发送的命令切分后得到的 token 列表  
@@ -22,6 +22,18 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
 
     // 2. 取出命令名并大写，方便大小写不敏感处理
     let cmd = parts[0].to_uppercase();
+
+    // 统一惰性过期：除 PING/QUIT 之外，凡是第一个参数当作 key 的命令，
+    // 在真正执行逻辑前先 remove_if_expired
+    if parts.len() > 1 {
+        match cmd.as_str() {
+            "PING" | "QUIT" => {}
+            _ => {
+                // 忽略错误
+                let _ = expire::remove_if_expired(db, &parts[1]);
+            }
+        }
+    }
 
     match cmd.as_str() {
         // --- String 原有命令 ---
@@ -174,11 +186,15 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
         }
         "LPOP" => {
             if parts.len() != 2 { "ERR wrong number of arguments for 'LPOP'".into() }
-            else { match list::lpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+            else {   
+                match list::lpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } 
+            }
         }
         "RPOP" => {
             if parts.len() != 2 { "ERR wrong number of arguments for 'RPOP'".into() }
-            else { match list::rpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+            else { 
+                match list::rpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } 
+            }
         }
         "LRANGE" => {
             if parts.len() != 4 { "ERR wrong number of arguments for 'LRANGE'".into() }
@@ -211,6 +227,48 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
         "SISMEMBER" => {
             if parts.len() != 3 { "ERR wrong number of arguments for 'SISMEMBER'".into() }
             else { match set::sismember(db, &parts[1], &parts[2]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
+        }
+
+        // --- 过期策略 ---
+        "EXPIRE" => {
+        // EXPIRE <key> <seconds>，增加过期时间
+            if parts.len() != 3 {
+                return "ERR wrong number of arguments for 'EXPIRE'".to_string();
+            }
+            let key = &parts[1];
+            // 秒数必须能 parse
+            match parts[2].parse::<u64>() {
+                Ok(secs) => {
+                    // 调用 expire 模块
+                    match expire::expire(db, key, secs) {
+                        Ok(v) => v,                   // "1" 或 "0"
+                        Err(e) => format!("ERR {}", e),
+                    }
+                }
+                Err(_) => "ERR value is not an integer or out of range".to_string(),
+            }
+        }
+
+        // TTL <key> ，查询过期时间
+        "TTL" => {
+            if parts.len() != 2 {
+                return "ERR wrong number of arguments for 'TTL'".to_string();
+            }
+            match expire::ttl(db, &parts[1]) {
+                Ok(v) => v,  // "-2", "-1" 或 剩余秒数
+                Err(e) => format!("ERR {}", e),
+            }
+        }
+
+        // PERSIST <key> ，删除过期时间
+        "PERSIST" => { 
+            if parts.len() != 2 {
+                return "ERR wrong number of arguments for 'PERSIST'".to_string();
+            }
+            match expire::persist(db, &parts[1]) {
+                Ok(v) => v,  // "1" 或 "0"
+                Err(e) => format!("ERR {}", e),
+            }
         }
 
         // 其他命令

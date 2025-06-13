@@ -3,7 +3,7 @@
 //! 支持 Hash 类型：每个 hash 对应一个 sled::Tree
 //! Tree 名称: "hash:<hashname>"
 
-use sled::{Db, IVec};
+use sled::Db;
 use anyhow::Result;
 
 /// HSET key field value
