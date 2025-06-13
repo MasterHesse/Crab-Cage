@@ -41,13 +41,17 @@
 
 - RESP 协议 TCP 服务器（默认端口 **6380**，避免与 Redis 冲突）  
 - 多种数据类型：  
-  - String: `GET`、`SET`、`DEL` 
+  - String: `GET`、`SET`、`DEL`  
   - Hash:  `HSET`、`HGET`、`HDEL`、`HKEYS`、`HVALS`、`HGETALL`  
   - List:  `LPUSH`、`RPUSH`、`LPOP`、`RPOP`、`LRANGE`  
   - Set:   `SADD`、`SREM`、`SMEMBERS`、`SISMEMBER`  
+- 过期策略：  
+  - `EXPIRE key seconds`：为 key 设置过期时间（单位：秒），返回 `1`（设置成功）或 `0`（key 不存在）  
+  - `TTL key`：查询 key 剩余生存时间，返回秒数、`-2`（key 不存在）、`-1`（key 无过期）  
+  - `PERSIST key`：移除 key 的过期时间，返回 `1`（移除成功）或 `0`（key 不存在或无过期）  
+  - 实现机制：惰性删除（访问时检测并删除过期 key），持久化时 AOF 中记录 `EXPIRE` 操作，重放时恢复过期元数据  
 - 持久化：AOF（Append-Only File）与 RDB（快照）  
-- 简易分片部署（正在开发）  
-- 零外部依赖（除 Tokio、serde、sled 等）  
+- 零外部依赖（除 Tokio、serde、sled 等） 
 
 ---
 
@@ -129,6 +133,20 @@ x,y
 1
 > SREM myset x
 1
+
+# --- 过期策略 ---
+> SET temp hello
+OK
+> TTL temp
+-1      # 默认无过期
+> EXPIRE temp 5
+1       # 设置 5 秒后过期
+> TTL temp
+5
+> PERSIST temp
+1       # 取消过期
+> TTL temp
+-1
 ```
 
 ---
@@ -141,6 +159,7 @@ x,y
 | Hash   | HSET, HGET, HDEL, HKEYS, HVALS, HGETALL  |
 | List   | LPUSH, RPUSH, LPOP, RPOP, LRANGE         |
 | Set    | SADD, SREM, SMEMBERS, SISMEMBER          |
+| Expire | EXPIRE, TTL, PERSIST                     |
 
 ---
 
