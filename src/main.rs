@@ -8,6 +8,7 @@ mod server;
 mod engine;
 mod types;
 mod expire;
+mod txn;
 
 use config::load;
 use persistence::Persistence;

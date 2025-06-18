@@ -1,4 +1,4 @@
-// tests/persistence_integration.rs
+// tests/integration_persistence.rs
 
 //! 集成测试：验证 AOF 持久化与重放，并验证 EXPIRE 生效
 //! 流程：

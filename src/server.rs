@@ -14,6 +14,7 @@ use tokio::{
 };
 use sled::Db;
 use crate::{engine, persistence::Persistence};
+use crate::txn::TxnContext;
 
 /// 按指定地址启动服务
 pub async fn start_with_addr_db_and_pers(
@@ -107,7 +108,13 @@ async fn handle_connection(
 
         // 3) 调度到 engine
         let cmd_name = parts[0].to_uppercase();
-        let is_write = matches!(cmd_name.as_str(), "SET" | "DEL" /*| ...*/);
+        let is_write = matches!(
+            cmd_name.as_str(),
+            /* String  */ "SET" | "DEL" | "INCR" | "DECR" |
+            /* Hash    */ "HSET" | "HDEL" |
+            /* List    */ "LPUSH" | "RPUSH" | "LPOP" | "RPOP" |
+            /* Set     */ "SADD" | "SREM"
+        );
         let raw = parts.join(" ");
         let resp = engine::execute(parts, &db);
 
