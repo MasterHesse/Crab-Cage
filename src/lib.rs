@@ -7,3 +7,4 @@ pub mod engine;    // 存储引擎（sled + 持久化）
 pub mod expire;    // 过期策略
 pub mod types;     // String / Hash / List / Set / ... 数据结构
 pub mod persistence;
+pub mod txn;

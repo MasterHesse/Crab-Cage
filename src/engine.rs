@@ -13,43 +13,39 @@ use sled::Db;
 use crate::types::{hash, list, set, string};
 use crate::expire;
 
-/// Execute a single client command against the given database.
+
+/// 对指定数据库执行单个客户端命令。
 ///
-/// # Arguments
+/// # 参数
 ///
-/// * `parts` – A `Vec<String>` containing the command name and its arguments,
-///   already split by the network layer. For example: `["SET", "key", "value"]`.
-/// * `db`    – A reference to the opened `sled::Db` instance.
+/// * `parts` – 包含命令名称及其参数的 `Vec<String>`，已由网络层拆分。例如：`[“SET”, ‘key’, “value”]`。
+/// * `db`    – 打开的 `sled::Db` 实例的引用。
 ///
-/// # Returns
+/// # 返回值
 ///
-/// A `String` representing the result of the command:
-/// - For successful operations: things like `"OK"`, `"PONG"`, or numeric/string payloads.
-/// - For errors: messages beginning with `"ERR "`, e.g. `"ERR wrong number of arguments"`.
+/// 表示命令结果的 `String`：
+/// - 成功操作：如 `“OK”`、`“PONG”` 或数值/字符串负载。
+/// - 错误：以 `“ERR ”` 开头的消息，例如 `“ERR 参数数量错误”`。
 ///
-/// # Behavior
+/// # 行为
 ///
-/// 1. **Empty Command Check**: Returns an error if no tokens are provided.
-/// 2. **Case-Insensitive Command Name**: Uppercases the first token to dispatch commands
-///    in a case-insensitive manner.
-/// 3. **Lazy Expiration**: For commands that take a key as their first argument (all except
-///    `PING` and `QUIT`), it invokes `expire::remove_if_expired` before execution,
-///    to purge expired keys transparently.
-/// 4. **Command Dispatch**: Matches on the uppercased command name and calls into
-///    the appropriate submodule or expiration functions.
-/// 5. **Argument Validation**: Checks the number and format of arguments, returning
-///    `"ERR wrong number of arguments for '<CMD>'"` or other parse errors as needed.
-/// 6. **Unknown Commands**: Returns `"ERR unknown command '<cmd>'"` for any unrecognized input.
+/// 1. **空命令检查**：若未提供令牌则返回错误。
+/// 2. **命令名称不区分大小写**：将第一个令牌大写以实现命令的不区分大小写分发。
+/// 3. **延迟过期**：对于以键作为第一个参数的命令（除 `PING` 和 `QUIT` 之外的所有命令），在执行前调用 `expire::remove_if_expired`，以透明地清除过期键。
+/// 4. **命令分发**：根据大写命令名称匹配，并调用相应的子模块或过期函数。
+/// 5. **参数验证**：检查参数的数量和格式，必要时返回 `“ERR 参数数量错误，命令为 ‘<CMD>’”` 或其他解析错误。
+/// 6. **未知命令**：对于任何未识别的输入，返回 `“ERR 未知命令 ‘<cmd>’”`。
+
 pub fn execute(parts: Vec<String>, db: &Db) -> String {
-    // 1. Empty command check
+    // 1. 空白命令检查
     if parts.is_empty() {
         return "ERR empty command".to_string();
     }
 
-    // 2. Extract command name and uppercase it for case-insensitive matching
+    // 2. 提取命令名称并将其转换为大写，以实现不区分大小写的匹配。
     let cmd = parts[0].to_uppercase();
 
-    // 3. Lazy expiration: for commands that operate on a key (parts[1]), remove it
+    // 3. 惰性过期检测，如果 `parts[1]`即`key`已过期，则移除
     //    if it's expired. We skip this for PING and QUIT.
     if parts.len() > 1 {
         match cmd.as_str() {
@@ -96,6 +92,26 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
         },
 
         // 原子增减操作
+        "INCR" => {
+            if parts.len() != 2 {
+                "ERR wrong number of arguments for 'INCR'".into()
+            } else {
+                match string::incr(db, &parts[1]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
+                }
+            }
+        }
+        "DECR" => {
+            if parts.len() != 2 {
+                "ERR wrong number of arguments for 'DECR'".into()
+            } else {
+                match string::decr(db, &parts[1]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
+                }
+            }
+        }
 
 
         // --- Hash commands ---
