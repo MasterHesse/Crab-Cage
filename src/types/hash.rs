@@ -1,77 +1,175 @@
 // src/types/hash.rs
 
-//! 支持 Hash 类型：每个 hash 对应一个 sled::Tree
-//! Tree 名称: "hash:<hashname>"
+//! # Hash Type Support
+//! 
+//! This module implements Redis-like Hash data structures on top of `sled`.
+//! Each hash key is stored as a separate `sled::Tree` named `"hash:<key>"`.
+//! 
+//! Supported commands:
+//! - `HSET`
+//! - `HGET`
+//! - `HDEL`
+//! - `HKEYS`
+//! - `HVALS`
+//! - `HGETALL`
 
 use sled::Db;
 use anyhow::Result;
 
-/// HSET key field value
-/// 返回 "1" 表示新建了 field，"0" 表示覆盖了旧值
+const PREFIX: &str = "hash:";
+
+/// Execute the HSET command:
+/// Set the string value of a hash field.
+///
+/// # Arguments
+///
+/// * `db`    – Reference to the opened `sled::Db`.
+/// * `key`   – Name of the hash.
+/// * `field` – Field within the hash to set.
+/// * `value` – Value to associate with `field`.
+///
+/// # Returns
+///
+/// * `"1"` if a new field was created.
+/// * `"0"` if an existing field’s value was overwritten.
+///
+/// # Errors
+///
+/// Returns an error if opening the tree, inserting the value, or flushing the tree fails.
 pub fn hset(db: &Db, key: &str, field: &str, value: &str) -> Result<String> {
-    let tree = db.open_tree(format!("hash:{}", key))?;
-    let prev = tree.insert(field, value.as_bytes())?;
+    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
+    let previous = tree.insert(field, value.as_bytes())?;
     tree.flush()?;
-    Ok(if prev.is_none() { "1".into() } else { "0".into() })
+    Ok(if previous.is_none() { "1".into() } else { "0".into() })
 }
 
-/// HGET key field
-/// 返回值，field 不存在时返回 "nil"
+/// Execute the HGET command:
+/// Get the value of a hash field.
+///
+/// # Arguments
+///
+/// * `db`    – Reference to the opened `sled::Db`.
+/// * `key`   – Name of the hash.
+/// * `field` – Field whose value to retrieve.
+///
+/// # Returns
+///
+/// * The field’s value as `String` if it exists.
+/// * `"nil"` if the field does not exist.
+///
+/// # Errors
+///
+/// Returns an error if opening the tree, reading the value, or UTF-8 conversion fails.
 pub fn hget(db: &Db, key: &str, field: &str) -> Result<String> {
-    let tree = db.open_tree(format!("hash:{}", key))?;
+    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
     match tree.get(field)? {
-        Some(ivec) => {
-            let s = std::str::from_utf8(&ivec)?;
+        Some(bytes) => {
+            let s = std::str::from_utf8(&bytes)?;
             Ok(s.to_string())
         }
         None => Ok("nil".into()),
     }
 }
 
-/// HDEL key field
-/// 返回 "1" 如果删除了一个存在的 field，"0" 否则
+/// Execute the HDEL command:
+/// Delete one or more hash fields.
+///
+/// # Arguments
+///
+/// * `db`    – Reference to the opened `sled::Db`.
+/// * `key`   – Name of the hash.
+/// * `field` – Field to delete.
+///
+/// # Returns
+///
+/// * `"1"` if the field existed and was removed.
+/// * `"0"` if the field did not exist.
+///
+/// # Errors
+///
+/// Returns an error if opening the tree, removing the value, or flushing the tree fails.
 pub fn hdel(db: &Db, key: &str, field: &str) -> Result<String> {
-    let tree = db.open_tree(format!("hash:{}", key))?;
-    let prev = tree.remove(field)?;
+    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
+    let removed = tree.remove(field)?;
     tree.flush()?;
-    Ok(if prev.is_some() { "1".into() } else { "0".into() })
+    Ok(if removed.is_some() { "1".into() } else { "0".into() })
 }
 
-/// HKEYS key
-/// 返回所有 field，用逗号分隔。不存在时返回空字符串。
+/// Execute the HKEYS command:
+/// Get all field names in a hash.
+///
+/// # Arguments
+///
+/// * `db`  – Reference to the opened `sled::Db`.
+/// * `key` – Name of the hash.
+///
+/// # Returns
+///
+/// A comma-separated `String` of all field names. Returns an empty string if the hash does not exist or has no fields.
+///
+/// # Errors
+///
+/// Returns an error if opening the tree, iterating, or UTF-8 conversion fails.
 pub fn hkeys(db: &Db, key: &str) -> Result<String> {
-    let tree = db.open_tree(format!("hash:{}", key))?;
-    let mut v = Vec::new();
-    for pair in tree.iter() {
-        let (k, _v) = pair?;
-        v.push(String::from_utf8(k.to_vec())?);
+    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
+    let mut fields = Vec::new();
+    for entry in tree.iter() {
+        let (k, _) = entry?;
+        fields.push(String::from_utf8(k.to_vec())?);
     }
-    Ok(v.join(","))
+    Ok(fields.join(","))
 }
 
-/// HVALS key
-/// 返回所有 value，用逗号分隔。不存在时返回空字符串。
+/// Execute the HVALS command:
+/// Get all values in a hash.
+///
+/// # Arguments
+///
+/// * `db`  – Reference to the opened `sled::Db`.
+/// * `key` – Name of the hash.
+///
+/// # Returns
+///
+/// A comma-separated `String` of all values. Returns an empty string if the hash does not exist or has no fields.
+///
+/// # Errors
+///
+/// Returns an error if opening the tree, iterating, or UTF-8 conversion fails.
 pub fn hvals(db: &Db, key: &str) -> Result<String> {
-    let tree = db.open_tree(format!("hash:{}", key))?;
-    let mut v = Vec::new();
-    for pair in tree.iter() {
-        let (_k, iv) = pair?;
-        v.push(std::str::from_utf8(&iv)?.to_string());
+    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
+    let mut values = Vec::new();
+    for entry in tree.iter() {
+        let (_, v) = entry?;
+        values.push(std::str::from_utf8(&v)?.to_string());
     }
-    Ok(v.join(","))
+    Ok(values.join(","))
 }
 
-/// HGETALL key
-/// 返回 field1,value1,field2,value2… 用逗号分隔。不存在时返回空字符串。
+/// Execute the HGETALL command:
+/// Get all fields and values in a hash.
+///
+/// # Arguments
+///
+/// * `db`  – Reference to the opened `sled::Db`.
+/// * `key` – Name of the hash.
+///
+/// # Returns
+///
+/// A comma-separated `String` in the form `field1,value1,field2,value2,…`.
+/// Returns an empty string if the hash does not exist or has no fields.
+///
+/// # Errors
+///
+/// Returns an error if opening the tree, iterating, or UTF-8 conversion fails.
 pub fn hgetall(db: &Db, key: &str) -> Result<String> {
-    let tree = db.open_tree(format!("hash:{}", key))?;
-    let mut v = Vec::new();
-    for pair in tree.iter() {
-        let (k, iv) = pair?;
-        v.push(String::from_utf8(k.to_vec())?);
-        v.push(std::str::from_utf8(&iv)?.to_string());
+    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
+    let mut entries = Vec::new();
+    for entry in tree.iter() {
+        let (k, v) = entry?;
+        entries.push(String::from_utf8(k.to_vec())?);
+        entries.push(std::str::from_utf8(&v)?.to_string());
     }
-    Ok(v.join(","))
+    Ok(entries.join(","))
 }
 
 #[cfg(test)]
@@ -80,42 +178,48 @@ mod tests {
     use tempfile::tempdir;
     use std::env;
 
+    /// Basic tests for Hash commands: HSET, HGET, HDEL, HKEYS, HVALS, HGETALL
     #[test]
     fn test_hash_basic() -> Result<()> {
+        // Create a temporary directory and open a sled database inside it.
         let tmp = tempdir()?;
         env::set_current_dir(&tmp)?;
         let db = sled::open("hdb")?;
 
-        // HSET 新 field
+        // HSET on a new field should return "1"
         assert_eq!(hset(&db, "myhash", "f1", "v1")?, "1");
-        // HSET 覆盖 field
+        // HSET on an existing field should return "0"
         assert_eq!(hset(&db, "myhash", "f1", "v1a")?, "0");
-        // HGET 存在
+        // HGET existing field
         assert_eq!(hget(&db, "myhash", "f1")?, "v1a");
-        // HGET 不存在
+        // HGET non-existent field returns "nil"
         assert_eq!(hget(&db, "myhash", "f2")?, "nil");
 
-        // HKEYS / HVALS / HGETALL
+        // Add another field for key/value listings
         hset(&db, "myhash", "f2", "v2")?;
-        let keys = hkeys(&db, "myhash")?;
-        let mut ks: Vec<&str> = keys.split(',').collect();
+
+        // HKEYS should list fields sorted lexicographically after split+sort
+        let hk = hkeys(&db, "myhash")?;
+        let mut ks: Vec<&str> = hk.split(',').collect();
         ks.sort();
         assert_eq!(ks, vec!["f1", "f2"]);
 
-        let vals = hvals(&db, "myhash")?;
-        let mut vs: Vec<&str> = vals.split(',').collect();
+        // HVALS should list values
+        let hv = hvals(&db, "myhash")?;
+        let mut vs: Vec<&str> = hv.split(',').collect();
         vs.sort();
         assert_eq!(vs, vec!["v1a", "v2"]);
 
-        let all = hgetall(&db, "myhash")?;
-        let mut elems: Vec<&str> = all.split(',').collect();
+        // HGETALL should list interleaved field,value pairs
+        let hga = hgetall(&db, "myhash")?;
+        let mut elems: Vec<&str> = hga.split(',').collect();
         elems.sort();
         assert_eq!(elems, vec!["f1", "f2", "v1a", "v2"]);
 
-        // HDEL 存在
+        // HDEL existing field returns "1" and subsequent HGET returns "nil"
         assert_eq!(hdel(&db, "myhash", "f1")?, "1");
         assert_eq!(hget(&db, "myhash", "f1")?, "nil");
-        // HDEL 不存在
+        // HDEL non-existent field returns "0"
         assert_eq!(hdel(&db, "myhash", "no")?, "0");
 
         Ok(())

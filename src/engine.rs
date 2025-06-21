@@ -1,119 +1,104 @@
 // src/engine.rs
 
-//! engine 模块：
-//! - 负责接收已经切分好的命令（Vec<String>）
-//! - 与 sled::Db 交互，执行业务（读写操作）
-//! - 返回一个 String 作为响应，供上层网络层封装成 RESP Simple String 或 Error
+//! # Engine Module
+//!
+//! The `engine` module is the core of the Redis-like server. It:
+//! - Receives parsed and tokenized commands (`Vec<String>`) from the network layer.
+//! - Interacts with the underlying `sled::Db` for data operations.
+//! - Delegates to type-specific submodules (`string`, `hash`, `list`, `set`) and the `expire`
+//!   module to execute business logic.
+//! - Returns a response `String`, which the network layer will format as RESP Simple Strings
+//!   or Errors.
+//!
+//! This design cleanly separates parsing, command dispatch, data storage, and expiration logic.
 
-use sled::Db; // sled 的数据库类型
-use crate::types::{hash, list, set}; // 支持多种数据类型
+use sled::Db;
+use crate::types::{hash, list, set, string};
 use crate::expire;
-/// 核心执行函数
+
+/// Execute a single client command against the given database.
 ///
-/// parts: 客户端发送的命令切分后得到的 token 列表  
-/// db:    sled 数据库实例  
+/// # Arguments
 ///
-/// 返回值：String，业务逻辑的“响应”，形如 "PONG"、"OK"、"ERR xxx"
+/// * `parts` – A `Vec<String>` containing the command name and its arguments,
+///   already split by the network layer. For example: `["SET", "key", "value"]`.
+/// * `db`    – A reference to the opened `sled::Db` instance.
+///
+/// # Returns
+///
+/// A `String` representing the result of the command:
+/// - For successful operations: things like `"OK"`, `"PONG"`, or numeric/string payloads.
+/// - For errors: messages beginning with `"ERR "`, e.g. `"ERR wrong number of arguments"`.
+///
+/// # Behavior
+///
+/// 1. **Empty Command Check**: Returns an error if no tokens are provided.
+/// 2. **Case-Insensitive Command Name**: Uppercases the first token to dispatch commands
+///    in a case-insensitive manner.
+/// 3. **Lazy Expiration**: For commands that take a key as their first argument (all except
+///    `PING` and `QUIT`), it invokes `expire::remove_if_expired` before execution,
+///    to purge expired keys transparently.
+/// 4. **Command Dispatch**: Matches on the uppercased command name and calls into
+///    the appropriate submodule or expiration functions.
+/// 5. **Argument Validation**: Checks the number and format of arguments, returning
+///    `"ERR wrong number of arguments for '<CMD>'"` or other parse errors as needed.
+/// 6. **Unknown Commands**: Returns `"ERR unknown command '<cmd>'"` for any unrecognized input.
 pub fn execute(parts: Vec<String>, db: &Db) -> String {
-    // 1. 空命令检查
+    // 1. Empty command check
     if parts.is_empty() {
         return "ERR empty command".to_string();
     }
 
-    // 2. 取出命令名并大写，方便大小写不敏感处理
+    // 2. Extract command name and uppercase it for case-insensitive matching
     let cmd = parts[0].to_uppercase();
 
-    // 统一惰性过期：除 PING/QUIT 之外，凡是第一个参数当作 key 的命令，
-    // 在真正执行逻辑前先 remove_if_expired
+    // 3. Lazy expiration: for commands that operate on a key (parts[1]), remove it
+    //    if it's expired. We skip this for PING and QUIT.
     if parts.len() > 1 {
         match cmd.as_str() {
             "PING" | "QUIT" => {}
             _ => {
-                // 忽略错误
+                // Ignore any expiration errors
                 let _ = expire::remove_if_expired(db, &parts[1]);
             }
         }
     }
 
+    // 4. Dispatch based on command name
     match cmd.as_str() {
-        // --- String 原有命令 ---
-        "PING" => {
-            // PING: 最简单的心跳，返回 PONG
-            "PONG".to_string()
-        }
-
+        // --- String commands ---
         "SET" => {
-            // SET <key> <value>
             if parts.len() != 3 {
-                return "ERR wrong number of arguments for 'SET' command".to_string();
-            }
-            let key = parts[1].as_bytes();
-            let val = parts[2].as_bytes();
-            // sled 的 insert 方法：插入或更新一个 key
-            match db.insert(key, val) {
-                Ok(_) => {
-                    // 我们这里先不立刻 db.flush()，让持久化模块统一管理
-                    "OK".to_string()
-                }
-                Err(e) => {
-                    // 任何底层错误都封装成 ERR 开头
-                    format!("ERR failed to SET: {}", e)
+                "ERR wrong number of arguments for 'SET'".into()
+            } else {
+                match string::set(db, &parts[1], &parts[2]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
                 }
             }
-        }
-
+        },
         "GET" => {
-            // GET <key>
             if parts.len() != 2 {
-                return "ERR wrong number of arguments for 'GET' command".to_string();
-            }
-            let key = parts[1].as_bytes();
-            // sled.get 返回 Result<Option<IVec>>
-            match db.get(key) {
-                Ok(Some(ivec)) => {
-                    // 我们假设存入的是 UTF-8 文本，尝试转换
-                    match std::str::from_utf8(&ivec) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => {
-                            // 如果不是合法 UTF-8，就当成错误
-                            format!("ERR non-utf8 data for key '{}'", parts[1])
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // key 不存在
-                    "ERR key not found".to_string()
-                }
-                Err(e) => {
-                    // sled 访问错误
-                    format!("ERR failed to GET: {}", e)
+                "ERR wrong number of arguments for 'GET'".into()
+            } else {
+                match string::get(db, &parts[1]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
                 }
             }
-        }
-
+        },
         "DEL" => {
-            // DEL <key>
             if parts.len() != 2 {
-                return "ERR wrong number of arguments for 'DEL' command".to_string();
-            }
-            let key = parts[1].as_bytes();
-            // sled.remove 返回 Result<Option<IVec>>
-            match db.remove(key) {
-                Ok(Some(_)) => {
-                    // 如果返回了 Some，说明确实删除了一个存在的 key
-                    "OK".to_string()
-                }
-                Ok(None) => {
-                    // key 本来就不存在
-                    "ERR key not found".to_string()
-                }
-                Err(e) => {
-                    format!("ERR failed to DEL: {}", e)
+                "ERR wrong number of arguments for 'DEL'".into()
+            } else {
+                match string::del(db, &parts[1]) {
+                    Ok(s) => s,
+                    Err(e) => format!("ERR {}", e),
                 }
             }
-        }
+        },
 
-        // --- Hash 命令 ---
+        // --- Hash commands ---
         "HSET" => {
             if parts.len() != 4 {
                 "ERR wrong number of arguments for 'HSET'".into()
@@ -175,7 +160,7 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
             }
         }
 
-        // --- List 命令 ---
+        // --- List commands ---
         "LPUSH" => {
             if parts.len() != 3 { "ERR wrong number of arguments for 'LPUSH'".into() }
             else { match list::lpush(db, &parts[1], &parts[2]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
@@ -186,19 +171,20 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
         }
         "LPOP" => {
             if parts.len() != 2 { "ERR wrong number of arguments for 'LPOP'".into() }
-            else {   
-                match list::lpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } 
+            else {
+                match list::lpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) }
             }
         }
         "RPOP" => {
             if parts.len() != 2 { "ERR wrong number of arguments for 'RPOP'".into() }
-            else { 
-                match list::rpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } 
+            else {
+                match list::rpop(db, &parts[1]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) }
             }
         }
         "LRANGE" => {
             if parts.len() != 4 { "ERR wrong number of arguments for 'LRANGE'".into() }
             else {
+                // Parse start and stop as signed integers
                 let start = parts[2].parse::<isize>();
                 let stop  = parts[3].parse::<isize>();
                 match (start, stop) {
@@ -211,7 +197,7 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
             }
         }
 
-        // --- Set 命令 ---
+        // --- Set commands ---
         "SADD" => {
             if parts.len() != 3 { "ERR wrong number of arguments for 'SADD'".into() }
             else { match set::sadd(db, &parts[1], &parts[2]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
@@ -229,57 +215,57 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
             else { match set::sismember(db, &parts[1], &parts[2]) { Ok(s)=>s, Err(e)=>format!("ERR {}", e) } }
         }
 
-        // --- 过期策略 ---
+        // --- Expiration commands ---
         "EXPIRE" => {
-        // EXPIRE <key> <seconds>，增加过期时间
+            // EXPIRE <key> <seconds>: set a TTL on key
             if parts.len() != 3 {
                 return "ERR wrong number of arguments for 'EXPIRE'".to_string();
             }
             let key = &parts[1];
-            // 秒数必须能 parse
             match parts[2].parse::<u64>() {
-                Ok(secs) => {
-                    // 调用 expire 模块
-                    match expire::expire(db, key, secs) {
-                        Ok(v) => v,                   // "1" 或 "0"
-                        Err(e) => format!("ERR {}", e),
-                    }
-                }
+                Ok(secs) => match expire::expire(db, key, secs) {
+                    Ok(v) => v,                  // "1" if TTL set, "0" if key does not exist
+                    Err(e) => format!("ERR {}", e),
+                },
                 Err(_) => "ERR value is not an integer or out of range".to_string(),
             }
         }
 
-        // TTL <key> ，查询过期时间
         "TTL" => {
+            // TTL <key>: get remaining TTL in seconds
             if parts.len() != 2 {
                 return "ERR wrong number of arguments for 'TTL'".to_string();
             }
             match expire::ttl(db, &parts[1]) {
-                Ok(v) => v,  // "-2", "-1" 或 剩余秒数
+                Ok(v) => v,   // "-2", "-1", or remaining seconds
                 Err(e) => format!("ERR {}", e),
             }
         }
 
-        // PERSIST <key> ，删除过期时间
-        "PERSIST" => { 
+        "PERSIST" => {
+            // PERSIST <key>: remove existing TTL
             if parts.len() != 2 {
                 return "ERR wrong number of arguments for 'PERSIST'".to_string();
             }
             match expire::persist(db, &parts[1]) {
-                Ok(v) => v,  // "1" 或 "0"
+                Ok(v) => v,   // "1" if TTL removed, "0" if key or TTL did not exist
                 Err(e) => format!("ERR {}", e),
             }
         }
 
-        // 其他命令
+        // --- Connection / Control commands ---
+        "PING" => {
+            // PING: health check, always returns "PONG"
+            "PONG".to_string()
+        }
         "QUIT" => {
-            // 客户端主动断开可能会发 QUIT
-            // 返回 OK，由 server 层决定断开循环
+            // QUIT: client indicates intent to close connection.
+            // Return "OK"; the server loop will handle terminating the session.
             "OK".to_string()
         }
 
+        // --- Unknown command ---
         other => {
-            // 不认识的命令
             format!("ERR unknown command '{}'", other)
         }
     }
