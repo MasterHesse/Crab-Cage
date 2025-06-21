@@ -1,16 +1,13 @@
 // src/engine.rs
 
-//! # Engine Module
+//! # 引擎模块
 //!
-//! The `engine` module is the core of the Redis-like server. It:
-//! - Receives parsed and tokenized commands (`Vec<String>`) from the network layer.
-//! - Interacts with the underlying `sled::Db` for data operations.
-//! - Delegates to type-specific submodules (`string`, `hash`, `list`, `set`) and the `expire`
-//!   module to execute business logic.
-//! - Returns a response `String`, which the network layer will format as RESP Simple Strings
-//!   or Errors.
-//!
-//! This design cleanly separates parsing, command dispatch, data storage, and expiration logic.
+//! `engine` 模块是 Redis 类服务器的核心。它：
+//! - 从网络层接收已解析和分词的命令（`Vec<String>`）。
+//! - 与底层的 `sled::Db` 进行数据操作交互。
+//! - 将业务逻辑委托给类型特定的子模块（`string`、`hash`、`list`、`set`）和 `expire` 模块执行。
+//! - 返回一个响应 `String`，网络层将将其格式化为 RESP 简单字符串或错误。
+
 
 use sled::Db;
 use crate::types::{hash, list, set, string};
@@ -97,6 +94,9 @@ pub fn execute(parts: Vec<String>, db: &Db) -> String {
                 }
             }
         },
+
+        // 原子增减操作
+
 
         // --- Hash commands ---
         "HSET" => {
