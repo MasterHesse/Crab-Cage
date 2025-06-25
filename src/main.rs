@@ -8,13 +8,14 @@ mod server;
 mod engine;
 mod types;
 mod expire;
+mod txn;
 
 use config::load;
 use persistence::Persistence;
 use sled::Db;
 use std::path::PathBuf;
 
-/// Rudis 启动参数
+/// crab-cage 启动参数
 #[derive(Parser, Debug)]
 #[command(author, version, about="Rudis server with AOF+RDB", long_about = None)]
 struct Args {
@@ -43,7 +44,7 @@ struct Args {
 async fn main() -> Result<()> {
     // 1. 解析命令行参数
     let args = Args::parse();
-    println!("Starting Rudis with args: {:?}", args);
+    println!("Starting Crab-Cage with args: {:?}", args);
 
     // 2. 读取 JSON 配置
     let cfg = load(&args.config)?;

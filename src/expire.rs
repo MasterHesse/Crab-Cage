@@ -1,12 +1,13 @@
 // src/expire.rs
 
-use sled::{Db, Tree};
-use anyhow::{Result};
+use anyhow::{Context, Result};
+use crate::engine::KvEngine;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::result::Result::Ok;
-use tokio::time::{interval, Duration};
+// use tokio::time::{interval, Duration};
 
-const EXPIRE_TREE: &str = "expire";
+/// 所有过期元数据都存到默认 tree 下的 key = "expire:{user_key}"
+const EXPIRE_PREFIX: &str = "expire:";
 
 /// 返回当前的 UNIX 毫秒
 fn now_ms() -> u64 {
@@ -16,106 +17,96 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// 获取 或 创建 expire Tree
-fn expire_tree(db: &Db) -> Result<Tree> {
-    Ok(db.open_tree(EXPIRE_TREE)?)
-}
-
 /// 设置 key 的过期时间
-pub fn expire(db: &Db, key: &str, secs: u64) -> Result<String> {
-    let tree = expire_tree(db)?;
-    let ts = now_ms().saturating_add(secs * 1000);
-    tree.insert(key.as_bytes(), &ts.to_be_bytes())?;
-    tree.flush()?;
-    Ok("1".into())
+pub fn expire<E:KvEngine>(db: &E, key: &str, secs: u64) -> Result<String> {
+    let ts = now_ms().saturating_add(secs * 1_000);
+    let meta = format!("{}{}", EXPIRE_PREFIX, key);
+    let prev = db   
+        .insert(meta.as_bytes(), &ts.to_be_bytes())
+        .context("ERR write EXPIRE")?;
+    Ok(if prev.is_none() {"1".into()} else {"0".into()})
 }
 
 /// 查询 key TTL （返回剩余时间，key 不存在 或 无 expire 返回 -1）
-pub fn ttl(db: &Db, key: &str) -> Result<String> {
-    let tree = expire_tree(db)?;
-    if let Some(ivec) = tree.get(key.as_bytes())? {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&ivec);
-        let exp_ts = u64::from_be_bytes(b);
+pub fn ttl<E: KvEngine>(db: &E, key: &str) -> Result<String> {
+    let meta = format!("{}{}", EXPIRE_PREFIX, key);
+    if let Some(bs) = db.get(meta.as_bytes()).context("ERR get TTL")? {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bs);
+        let exp_ts = u64::from_be_bytes(buf);
         let now = now_ms();
         if exp_ts <= now {
-            // 惰性清理
             remove_key(db, key)?;
             return Ok("-2".into());
         }
-        let secs_left = ((exp_ts - now) + 999) / 1000;
-        Ok(format!("{}", secs_left))
+        let left = ((exp_ts - now) + 999) / 1000;
+        Ok(left.to_string())
     } else {
         Ok("-1".into())
     }
 }
 
 /// 移除 key 的过期属性
-pub fn persist(db: &Db, key: &str) -> Result<String> {
-    let tree = expire_tree(db)?;
-    let prev = tree.remove(key.as_bytes())?;
-    if prev.is_some() {
-        tree.flush()?;
-        Ok("1".into())
-    } else {
-        Ok("0".into())
-    }
+pub fn persist<E:KvEngine>(db: &E, key: &str) -> Result<String> {
+    let meta = format!("{}{}", EXPIRE_PREFIX, key);
+    let prev = db
+        .remove(meta.as_bytes())
+        .context("ERR PERSIST")?;
+    Ok(if prev.is_some() {"1".into()} else {"0".into()})
 }
 
 /// 检查 key 是否过期，是则删除所有相关记录
-pub fn remove_if_expired(db: &Db, key: &str) -> Result<()> {
-    let tree = expire_tree(db)?;
-    if let Some(ivec) = tree.get(key.as_bytes())? {
-        let mut b = [0u8;8];
-        b.copy_from_slice(&ivec);
-        let exp_ts = u64::from_be_bytes(b);
-        if exp_ts <= now_ms() {
-            remove_key(db, key)?;
+pub fn remove_if_expired<E: KvEngine>(db: &E, key: &str) -> Result<()> {
+    let meta = format!("{}{}", EXPIRE_PREFIX, key);
+    if let Some(bs) = db.get(meta.as_bytes()).context("ERR get EXPIRE")? {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bs);
+        if u64::from_be_bytes(buf) <= now_ms() {
+            remove_key(db.as_db().expect("ERR remove EXPIRE"), key)?;
         }
     }
     Ok(())
 }
 
 /// 删除主 data tree 和 各类型 子 Tree 和 expire Tree
-fn remove_key(db: &Db, key: &str) -> Result<()> {
-    // 1. 从主 Data tree 删除
-    let _ = db.remove(key.as_bytes())?;
-    // 2. 从 hash，list，set 等拓展数据类型删除
-    let _ = db.drop_tree(format!("hash:{}", key));
-    let _ = db.drop_tree(format!("list:{}", key));
-    let _ = db.drop_tree(format!("set:{}", key));
-    // 3. 删除过期 entry
-    let tree = expire_tree(db)?;
-    let _ = tree.remove(key.as_bytes())?;
-    tree.flush()?;
-    db.flush()?;
-    
+pub fn remove_key<E: KvEngine>(db: &E, key: &str) -> Result<()> {
+    // 1) 默认 tree 下删主 key
+    let main_key = key.as_bytes();
+    let _ = db.remove(main_key).context("ERR remove main data")?;
+
+    // 2) 删过期元数据
+    let meta = format!("{}{}", EXPIRE_PREFIX, key);
+    let _ = db.remove(meta.as_bytes()).context("ERR remove EXPIRE")?;
+
+    // 3) 如果是 &Db，就能 drop_tree
+    if let Some(plain) = db.as_db() {
+        let _ = plain.drop_tree(format!("hash:{}", key));
+        let _ = plain.drop_tree(format!("list:{}", key));
+        let _ = plain.drop_tree(format!("set:{}", key));
+        let _ = plain.drop_tree(format!("string:{}",key));
+    }
     Ok(())
 }
 /// 后台定时清理任务
-pub async fn start_cleaner(db: Db, interval_secs: u64) {
-    let mut iv = interval(Duration::from_secs(interval_secs));
-    loop {
-        iv.tick().await;
-        match db.open_tree(EXPIRE_TREE) {
-            Ok(tree) => {
-                let now_bytes = now_ms().to_be_bytes();
-                // iterate over all keys <= now
-                for entry in tree.range(..=now_bytes) {
-                    if let Ok((k, _)) = entry {
-                        if let Ok(key_str) = std::str::from_utf8(&k) {
-                            // delete expired key
-                            let _ = remove_key(&db, key_str);
-                        }
-                    }
-                }
-            }
-            Err(_e) => {
-                
-            }
-        }
-    }
-}
+// pub async fn start_cleaner(db: sled::Db, interval_secs: u64) {
+//     let mut iv = interval(Duration::from_secs(interval_secs));
+//     loop {
+//         iv.tick().await;
+//         let now = now_ms().to_be_bytes();
+
+//         // scan_prefix 只遍历默认 tree 下所有 "expire:" 开头的 entry
+//         for entry in db.scan_prefix(EXPIRE_PREFIX.as_bytes()) {
+//             if let Ok((k, v)) = entry {
+//                 // k = b"expire:thekey"
+//                 if v <= (&now).into() {
+//                     if let Ok(kstr) = std::str::from_utf8(&k[EXPIRE_PREFIX.len()..]) {
+//                         let _ = remove_key(&db, kstr);
+//                     }
+//                 }
+//             }
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -138,7 +129,7 @@ mod tests {
         sleep(std::time::Duration::from_millis(1200));
         // TTL 返回 -2，且 key 被删除
         assert_eq!(ttl(&db, "k")?, "-2");
-        assert!(db.get("k")?.is_none());
+        assert!(db.get(b"k")?.is_none());
 
         Ok(())
     }

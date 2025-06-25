@@ -13,8 +13,8 @@
 //! - `SMEMBERS`
 //! - `SISMEMBER`
 
-use sled::Db;
-use anyhow::Result;
+use anyhow::{Result,Context};
+use crate::engine::kv::KvEngine;
 
 const PREFIX: &str = "set:";
 
@@ -36,10 +36,14 @@ const PREFIX: &str = "set:";
 ///
 /// Returns an error if opening the tree, inserting the member,
 /// or flushing the tree fails.
-pub fn sadd(db: &Db, key: &str, member: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    let prev = tree.insert(member, &[])?;
-    tree.flush()?;
+pub fn sadd<E>(db: &E, key: &str, member: &str) -> Result<String> 
+where 
+    E: KvEngine,
+{
+    let namespaced = format!("{}{}:{}", PREFIX, key, member);
+    let prev = db
+        .insert(namespaced.as_bytes(), &[])
+        .with_context(|| format!("ERR failed to SADD {}/{}", key, member))?;
     Ok(if prev.is_none() { "1".into() } else { "0".into() })
 }
 
@@ -61,11 +65,45 @@ pub fn sadd(db: &Db, key: &str, member: &str) -> Result<String> {
 ///
 /// Returns an error if opening the tree, removing the member,
 /// or flushing the tree fails.
-pub fn srem(db: &Db, key: &str, member: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    let prev = tree.remove(member)?;
-    tree.flush()?;
+pub fn srem<E>(db: &E, key: &str, member: &str) -> Result<String> 
+where 
+    E: KvEngine,
+{
+    let namespaced = format!("{}{}:{}", PREFIX, key, member);
+    let prev = db
+        .remove(namespaced.as_bytes())
+        .with_context(|| format!("ERR failed to SREM {}/{}", key, member))?;
     Ok(if prev.is_some() { "1".into() } else { "0".into() })
+}
+
+
+/// Execute the SISMEMBER command:
+/// Check if the specified `member` exists in the set stored at `key`.
+///
+/// # Arguments
+///
+/// * `db`     – Reference to the opened `sled::Db`.
+/// * `key`    – Name of the set.
+/// * `member` – Member to check for existence.
+///
+/// # Returns
+///
+/// * `"1"` if the member exists in the set.
+/// * `"0"` if the member does not exist.
+///
+/// # Errors
+///
+/// Returns an error if opening the tree or checking for the key fails.
+pub fn sismember<E>(db: &E, key: &str, member: &str) -> Result<String> 
+where 
+    E:KvEngine
+{
+    let namespaced = format!("{}{}:{}", PREFIX,key,member);
+    let exist = db
+        .get(namespaced.as_bytes())
+        .with_context(|| format!("ERR failed to SISMEMBER {}/{}", key, member))?
+        .is_some();
+    Ok(if exist { "1".into() } else { "0".into() })
 }
 
 /// Execute the SMEMBERS command:
@@ -85,51 +123,38 @@ pub fn srem(db: &Db, key: &str, member: &str) -> Result<String> {
 ///
 /// Returns an error if opening the tree, iterating entries,
 /// or converting bytes to UTF-8 strings fails.
-pub fn smembers(db: &Db, key: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
+pub fn smembers<E>(db: &E, key: &str) -> Result<String> 
+where 
+    E:KvEngine
+{
+    let prefix = format!("{}{}:",PREFIX,key);
     let mut members = Vec::new();
-    for item in tree.iter() {
+    for item in db.scan_prefix(prefix.as_bytes()) {
         let (k, _) = item?;
-        members.push(String::from_utf8(k.to_vec())?);
+        members.push(std::str::from_utf8(&k[prefix.len()..])?.to_string());
     }
     Ok(members.join(","))
-}
-
-/// Execute the SISMEMBER command:
-/// Check if the specified `member` exists in the set stored at `key`.
-///
-/// # Arguments
-///
-/// * `db`     – Reference to the opened `sled::Db`.
-/// * `key`    – Name of the set.
-/// * `member` – Member to check for existence.
-///
-/// # Returns
-///
-/// * `"1"` if the member exists in the set.
-/// * `"0"` if the member does not exist.
-///
-/// # Errors
-///
-/// Returns an error if opening the tree or checking for the key fails.
-pub fn sismember(db: &Db, key: &str, member: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    Ok(if tree.contains_key(member)? { "1".into() } else { "0".into() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-    use std::env;
+    use sled::Config;
+    use anyhow::Result;
+
+    /// 创建一个临时的 sled::Db，用于测试
+    fn make_db() -> sled::Db {
+        Config::new()
+            .temporary(true)
+            .open()
+            .expect("打开临时 sled db 失败")
+    } 
 
     /// Basic tests for Set commands: SADD, SREM, SMEMBERS, SISMEMBER
     #[test]
     fn test_set_basic() -> Result<()> {
         // Create a temporary directory and open a sled database.
-        let tmp = tempdir()?;
-        env::set_current_dir(&tmp)?;
-        let db = sled::open("sdb")?;
+        let db = make_db();
 
         // SADD: add members "a" and "b"
         assert_eq!(sadd(&db, "S", "a")?, "1");

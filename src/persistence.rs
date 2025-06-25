@@ -85,7 +85,7 @@ impl Persistence {
                     continue;
                 }
                 // 调用 engine 执行业务命令（包括 SET/DEL/EXPIRE/..）
-                let _ = engine::execute(parts, &self.db);
+                let _ = engine::execute_non_txn_command(&parts[0].to_uppercase(), &parts, &self.db);
             }
             self.db.flush()?;
         }

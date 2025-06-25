@@ -13,8 +13,8 @@
 //! - `HVALS`
 //! - `HGETALL`
 
-use sled::Db;
-use anyhow::Result;
+use anyhow::{Context, Ok, Result};
+use crate::engine::kv::KvEngine;
 
 const PREFIX: &str = "hash:";
 
@@ -36,11 +36,16 @@ const PREFIX: &str = "hash:";
 /// # Errors
 ///
 /// Returns an error if opening the tree, inserting the value, or flushing the tree fails.
-pub fn hset(db: &Db, key: &str, field: &str, value: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    let previous = tree.insert(field, value.as_bytes())?;
-    tree.flush()?;
-    Ok(if previous.is_none() { "1".into() } else { "0".into() })
+pub fn hset<E>(db: &E, key: &str, field: &str, value: &str) -> Result<String> 
+where 
+    E: KvEngine,
+{
+    let namespaced = format!("{}{}:{}", PREFIX, key, field);
+    let prev = db
+        .insert(namespaced.as_bytes(), value.as_bytes())
+        .with_context(|| format!("ERR failed to HSET {}/{}", key, field))?;
+
+    Ok(if prev.is_none() { "1".into() } else { "0".into() })
 }
 
 /// Execute the HGET command:
@@ -60,14 +65,17 @@ pub fn hset(db: &Db, key: &str, field: &str, value: &str) -> Result<String> {
 /// # Errors
 ///
 /// Returns an error if opening the tree, reading the value, or UTF-8 conversion fails.
-pub fn hget(db: &Db, key: &str, field: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    match tree.get(field)? {
-        Some(bytes) => {
-            let s = std::str::from_utf8(&bytes)?;
-            Ok(s.to_string())
-        }
-        None => Ok("nil".into()),
+pub fn hget<E>(db: &E, key: &str, field: &str) -> Result<String> 
+where 
+    E:KvEngine,
+{
+    let namespaced = format!("{}{}:{}", PREFIX, key, field);
+    if let Some(bytes) = db.get(namespaced.as_bytes())? {
+        let s = std::str::from_utf8(&bytes)
+            .context("ERR non-utf8 in HGET")?;
+        Ok(s.to_string())
+    } else {
+        Ok("nil".into())
     }
 }
 
@@ -88,10 +96,12 @@ pub fn hget(db: &Db, key: &str, field: &str) -> Result<String> {
 /// # Errors
 ///
 /// Returns an error if opening the tree, removing the value, or flushing the tree fails.
-pub fn hdel(db: &Db, key: &str, field: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    let removed = tree.remove(field)?;
-    tree.flush()?;
+pub fn hdel<E>(db: &E, key: &str, field: &str) -> Result<String> 
+where 
+    E:KvEngine
+{
+    let namespaced = format!("{}{}:{}", PREFIX, key, field);
+    let removed = db.remove(namespaced.as_bytes())?;
     Ok(if removed.is_some() { "1".into() } else { "0".into() })
 }
 
@@ -110,13 +120,19 @@ pub fn hdel(db: &Db, key: &str, field: &str) -> Result<String> {
 /// # Errors
 ///
 /// Returns an error if opening the tree, iterating, or UTF-8 conversion fails.
-pub fn hkeys(db: &Db, key: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
+pub fn hkeys<E>(db: &E, key: &str) -> Result<String> 
+where 
+    E:KvEngine,
+{
+    let prefix = format!("{}{}:", PREFIX, key);
     let mut fields = Vec::new();
-    for entry in tree.iter() {
+    
+    for entry in db.scan_prefix(prefix.as_bytes()) {
         let (k, _) = entry?;
-        fields.push(String::from_utf8(k.to_vec())?);
+        let field = std::str::from_utf8(&k[prefix.len()..])?;
+        fields.push(field.to_string());
     }
+    
     Ok(fields.join(","))
 }
 
@@ -135,13 +151,19 @@ pub fn hkeys(db: &Db, key: &str) -> Result<String> {
 /// # Errors
 ///
 /// Returns an error if opening the tree, iterating, or UTF-8 conversion fails.
-pub fn hvals(db: &Db, key: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
+pub fn hvals<E>(db: &E, key: &str) -> Result<String> 
+where 
+    E: KvEngine,
+{
+    let prefix = format!("{}{}:", PREFIX, key);
     let mut values = Vec::new();
-    for entry in tree.iter() {
+    
+    for entry in db.scan_prefix(prefix.as_bytes()) {
         let (_, v) = entry?;
-        values.push(std::str::from_utf8(&v)?.to_string());
+        let value = std::str::from_utf8(&v)?;
+        values.push(value.to_string());
     }
+    
     Ok(values.join(","))
 }
 
@@ -161,12 +183,15 @@ pub fn hvals(db: &Db, key: &str) -> Result<String> {
 /// # Errors
 ///
 /// Returns an error if opening the tree, iterating, or UTF-8 conversion fails.
-pub fn hgetall(db: &Db, key: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
+pub fn hgetall<E>(db: &E, key: &str) -> Result<String> 
+where 
+    E: KvEngine
+{
+    let prefix = format!("{}{}:", PREFIX, key);
     let mut entries = Vec::new();
-    for entry in tree.iter() {
+    for entry in db.scan_prefix(prefix.as_bytes()) {
         let (k, v) = entry?;
-        entries.push(String::from_utf8(k.to_vec())?);
+        entries.push(std::str::from_utf8(&k[prefix.len()..])?.to_string());
         entries.push(std::str::from_utf8(&v)?.to_string());
     }
     Ok(entries.join(","))
@@ -175,16 +200,22 @@ pub fn hgetall(db: &Db, key: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-    use std::env;
+    use sled::Config;
+    use anyhow::Result;
+
+    /// 创建一个临时的 sled::Db，用于测试
+    fn make_db() -> sled::Db {
+        Config::new()
+            .temporary(true)
+            .open()
+            .expect("打开临时 sled db 失败")
+    }   
 
     /// Basic tests for Hash commands: HSET, HGET, HDEL, HKEYS, HVALS, HGETALL
     #[test]
     fn test_hash_basic() -> Result<()> {
         // Create a temporary directory and open a sled database inside it.
-        let tmp = tempdir()?;
-        env::set_current_dir(&tmp)?;
-        let db = sled::open("hdb")?;
+        let db = make_db();
 
         // HSET on a new field should return "1"
         assert_eq!(hset(&db, "myhash", "f1", "v1")?, "1");

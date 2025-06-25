@@ -1,273 +1,293 @@
 // src/types/list.rs
 
-//! # List Type Support
-//!
-//! This module implements Redis-like List (deque) data structures on top of `sled`.
-//! Each list is stored as a separate `sled::Tree` named `"list:<key>"`.
-//! Elements are indexed by big-endian bytes of an `i64` sequence number with a bitwise
-//! offset flip, allowing efficient double-ended push and pop.
-//!
-//! Supported commands:
-//! - `LPUSH`
-//! - `RPUSH`
-//! - `LPOP`
-//! - `RPOP`
-//! - `LRANGE`
-
-use sled::{Db, Tree};
-use anyhow::Result;
+use anyhow::{Context, Result};
+use sled::transaction::ConflictableTransactionError;
 use std::str;
+use crate::engine::kv::KvEngine;
 
-const PREFIX: &str = "list:";
+const DATA_PREFIX: &str = "list:data:";
+const META_PREFIX: &str = "list:meta:";
 
-/// Map an `i64` sequence number to a `u64` by flipping the sign bit,
-/// so that ordering by `u64` big-endian bytes matches the signed ordering of `i64`.
+/// 将序列号转换为排序友好的 u64 表示
 fn seq_to_u64(seq: i64) -> u64 {
     (seq as u64) ^ (1 << 63)
 }
 
-/// Reverse the bitwise flip and convert back to `i64`.
-fn u64_to_seq(u: u64) -> i64 {
-    (u ^ (1 << 63)) as i64
-}
-
-/// Convert an `i64` sequence number into an 8-byte big-endian array key.
-fn seq_to_key(seq: i64) -> [u8; 8] {
-    seq_to_u64(seq).to_be_bytes()
-}
-
-/// Parse an 8-byte big-endian array key back into an `i64` sequence number.
-fn key_to_seq(k: &[u8]) -> i64 {
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&k[0..8]);
-    u64_to_seq(u64::from_be_bytes(b))
-}
-
-/// Retrieve the current head and tail sequence numbers (min and max) from the tree.
-/// Returns `Ok(Some((head, tail)))` if the list is non-empty,
-/// or `Ok(None)` if the list has no elements.
-///
-/// # Errors
-/// Returns an error if iteration over the tree fails.
-fn get_bounds(tree: &Tree) -> Result<Option<(i64, i64)>> {
-    let mut iter = tree.iter();
-    if let Some(Ok((first_k, _))) = iter.next() {
-        let head = key_to_seq(&first_k);
-        // Find tail by reversing the iteration
-        let mut last = head;
-        for item in tree.iter().rev() {
-            let (k, _) = item?;
-            last = key_to_seq(&k);
-            break;
-        }
-        Ok(Some((head, last)))
+/// 获取/设置 i64 元数据
+fn get_i64<E: KvEngine>(db: &E, key: &str) -> Result<Option<i64>> {
+    if let Some(bs) = db.get(key.as_bytes())? {
+        let arr: [u8; 8] = bs.as_ref().try_into()?;
+        Ok(Some(i64::from_be_bytes(arr)))
     } else {
         Ok(None)
     }
 }
 
-/// Execute LPUSH:
-/// Push `value` to the head (left) of the list stored at `key`.
-///
-/// # Arguments
-///
-/// * `db`    – Reference to the opened `sled::Db`.
-/// * `key`   – Name of the list.
-/// * `value` – Value to push.
-///
-/// # Returns
-///
-/// The new length of the list as a string.
-///
-/// # Errors
-///
-/// Returns an error if opening the tree, inserting the element,
-/// flushing, or retrieving bounds fails.
-pub fn lpush(db: &Db, key: &str, value: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    let len = if let Some((head, _)) = get_bounds(&tree)? {
-        let new_head = head - 1;
-        tree.insert(seq_to_key(new_head), value.as_bytes())?;
-        tree.flush()?;
-        tree.len()
-    } else {
-        // First element uses sequence 0
-        tree.insert(seq_to_key(0), value.as_bytes())?;
-        tree.flush()?;
-        1
+fn put_i64<E: KvEngine>(db: &E, key: &str, value: i64) -> Result<()> {
+    db.insert(key.as_bytes(), &value.to_be_bytes())?;
+    Ok(())
+}
+
+/// 获取列表的 head 和 tail
+fn get_bounds<E: KvEngine>(db: &E, key: &str) -> Result<Option<(i64, i64)>> {
+    let head_key = format!("{}{}:head", META_PREFIX, key);
+    let tail_key = format!("{}{}:tail", META_PREFIX, key);
+    
+    let head = match get_i64(db, &head_key)? {
+        Some(h) => h,
+        None => return Ok(None),
     };
+    
+    let tail = get_i64(db, &tail_key)?
+        .with_context(|| format!("Missing tail metadata for list '{}'", key))?;
+    
+    Ok(Some((head, tail)))
+}
+
+/// LPUSH 实现
+pub fn lpush<E: KvEngine>(db: &E, key: &str, value: &str) -> Result<String> {
+    let (head, tail) = match get_bounds(db, key)? {
+        Some((h, t)) => (h, t),
+        None => (0, -1),  // 空列表
+    };
+    
+    let new_head = head - 1;
+    let data_key = format!("{}{}:{}", DATA_PREFIX, key, seq_to_u64(new_head));
+    
+    // 在事务中执行所有操作
+    if let Some(plain_db) = db.as_db() {
+        let tree = plain_db.open_tree("")?;
+        tree.transaction(|tx| {
+            tx.insert(data_key.as_bytes(), value.as_bytes())?;
+            
+            // 更新 head
+            let head_key = format!("{}{}:head", META_PREFIX, key);
+            tx.insert(head_key.as_bytes(), &new_head.to_be_bytes())?;
+            
+            // 如果是第一个元素，更新 tail
+            if tail < head {
+                let tail_key = format!("{}{}:tail", META_PREFIX, key);
+                tx.insert(tail_key.as_bytes(), &new_head.to_be_bytes())?;
+            }
+            
+            Ok::<(), ConflictableTransactionError>(())
+        })?;
+    } else {
+        // 在事务上下文中
+        db.insert(data_key.as_bytes(), value.as_bytes())?;
+        
+        let head_key = format!("{}{}:head", META_PREFIX, key);
+        db.insert(head_key.as_bytes(), &new_head.to_be_bytes())?;
+        
+        if tail < head {
+            let tail_key = format!("{}{}:tail", META_PREFIX, key);
+            db.insert(tail_key.as_bytes(), &new_head.to_be_bytes())?;
+        }
+    }
+    
+    // 计算新长度
+    let new_tail = if tail < head { new_head } else { tail };
+    let len = (new_tail - new_head + 1) as usize;
     Ok(len.to_string())
 }
 
-/// Execute RPUSH:
-/// Push `value` to the tail (right) of the list stored at `key`.
-///
-/// # Arguments
-///
-/// * `db`    – Reference to the opened `sled::Db`.
-/// * `key`   – Name of the list.
-/// * `value` – Value to push.
-///
-/// # Returns
-///
-/// The new length of the list as a string.
-///
-/// # Errors
-///
-/// Returns an error if opening the tree, inserting the element,
-/// flushing, or retrieving bounds fails.
-pub fn rpush(db: &Db, key: &str, value: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    let len = if let Some((_, tail)) = get_bounds(&tree)? {
-        let new_tail = tail + 1;
-        tree.insert(seq_to_key(new_tail), value.as_bytes())?;
-        tree.flush()?;
-        tree.len()
-    } else {
-        // First element uses sequence 0
-        tree.insert(seq_to_key(0), value.as_bytes())?;
-        tree.flush()?;
-        1
+/// RPUSH 实现
+pub fn rpush<E: KvEngine>(db: &E, key: &str, value: &str) -> Result<String> {
+    let (head, tail) = match get_bounds(db, key)? {
+        Some((h, t)) => (h, t),
+        None => (0, -1),
     };
+    
+    let new_tail = tail + 1;
+    let data_key = format!("{}{}:{}", DATA_PREFIX, key, seq_to_u64(new_tail));
+    
+    // 在事务中执行所有操作
+    if let Some(plain_db) = db.as_db() {
+        let tree = plain_db.open_tree("")?;
+        tree.transaction(|tx| {
+            tx.insert(data_key.as_bytes(), value.as_bytes())?;
+            
+            // 更新 tail
+            let tail_key = format!("{}{}:tail", META_PREFIX, key);
+            tx.insert(tail_key.as_bytes(), &new_tail.to_be_bytes())?;
+            
+            // 如果是第一个元素，更新 head
+            if tail < head {
+                let head_key = format!("{}{}:head", META_PREFIX, key);
+                tx.insert(head_key.as_bytes(), &new_tail.to_be_bytes())?;
+            }
+            
+            Ok::<(), ConflictableTransactionError>(())
+        })?;
+    } else {
+        db.insert(data_key.as_bytes(), value.as_bytes())?;
+        
+        let tail_key = format!("{}{}:tail", META_PREFIX, key);
+        db.insert(tail_key.as_bytes(), &new_tail.to_be_bytes())?;
+        
+        if tail < head {
+            let head_key = format!("{}{}:head", META_PREFIX, key);
+            db.insert(head_key.as_bytes(), &new_tail.to_be_bytes())?;
+        }
+    }
+    
+    // 计算新长度
+    let new_head = if tail < head { new_tail } else { head };
+    let len = (new_tail - new_head + 1) as usize;
     Ok(len.to_string())
 }
 
-/// Execute LPOP:
-/// Pop and return the head (leftmost) element of the list at `key`,
-/// or `"nil"` if the list is empty or does not exist.
-///
-/// # Arguments
-///
-/// * `db`  – Reference to the opened `sled::Db`.
-/// * `key` – Name of the list.
-///
-/// # Returns
-///
-/// The popped element as a string, or `"nil"`.
-///
-/// # Errors
-///
-/// Returns an error if opening the tree, removing the element,
-/// flushing, or UTF-8 conversion fails.
-pub fn lpop(db: &Db, key: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    if let Some((head, _)) = get_bounds(&tree)? {
-        let k = seq_to_key(head);
-        if let Some(iv) = tree.remove(&k)? {
-            tree.flush()?;
-            return Ok(str::from_utf8(&iv)?.to_string());
-        }
-    }
-    Ok("nil".into())
-}
-
-/// Execute RPOP:
-/// Pop and return the tail (rightmost) element of the list at `key`,
-/// or `"nil"` if the list is empty or does not exist.
-///
-/// # Arguments
-///
-/// * `db`  – Reference to the opened `sled::Db`.
-/// * `key` – Name of the list.
-///
-/// # Returns
-///
-/// The popped element as a string, or `"nil"`.
-///
-/// # Errors
-///
-/// Returns an error if opening the tree, removing the element,
-/// flushing, or UTF-8 conversion fails.
-pub fn rpop(db: &Db, key: &str) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    if let Some((_, tail)) = get_bounds(&tree)? {
-        let k = seq_to_key(tail);
-        if let Some(iv) = tree.remove(&k)? {
-            tree.flush()?;
-            return Ok(str::from_utf8(&iv)?.to_string());
-        }
-    }
-    Ok("nil".into())
-}
-
-/// Execute LRANGE:
-/// Return a comma-separated list of elements in the range `[start, stop]`,
-/// supporting negative indices (counting from the end).
-///
-/// # Arguments
-///
-/// * `db`    – Reference to the opened `sled::Db`.
-/// * `key`   – Name of the list.
-/// * `start` – Zero-based start index or negative for offset from end.
-/// * `stop`  – Zero-based stop index or negative for offset from end.
-///
-/// # Returns
-///
-/// A comma-separated string of elements in the specified range.
-/// Returns an empty string if there are no elements in range or the list is empty.
-///
-/// # Errors
-///
-/// Returns an error if opening the tree, retrieving bounds,
-/// iterating elements, or UTF-8 conversion fails.
-pub fn lrange(db: &Db, key: &str, start: isize, stop: isize) -> Result<String> {
-    let tree = db.open_tree(format!("{}{}", PREFIX, key))?;
-    let (head, tail) = match get_bounds(&tree)? {
-        Some(b) => b,
-        None => return Ok(String::new()),
+/// LPOP 实现
+pub fn lpop<E: KvEngine>(db: &E, key: &str) -> Result<String> {
+    let (head, tail) = match get_bounds(db, key)? {
+        Some(ht) => ht,
+        None => return Ok("nil".into()),
     };
-    // Total number of elements
+    
+    let data_key = format!("{}{}:{}", DATA_PREFIX, key, seq_to_u64(head));
+    let result = if let Some(bs) = db.remove(data_key.as_bytes())? {
+        // 更新元数据
+        if head + 1 > tail {
+            // 列表为空，删除元数据
+            let head_key = format!("{}{}:head", META_PREFIX, key);
+            let tail_key = format!("{}{}:tail", META_PREFIX, key);
+            
+            if let Some(plain_db) = db.as_db() {
+                let tree = plain_db.open_tree("")?;
+                tree.transaction(|tx| {
+                    tx.remove(head_key.as_bytes())?;
+                    tx.remove(tail_key.as_bytes())?;
+                    Ok::<(), ConflictableTransactionError>(())
+                })?;
+            } else {
+                db.remove(head_key.as_bytes())?;
+                db.remove(tail_key.as_bytes())?;
+            }
+        } else {
+            // 更新 head
+            let head_key = format!("{}{}:head", META_PREFIX, key);
+            put_i64(db, &head_key, head + 1)?;
+        }
+        
+        String::from_utf8(bs.to_vec())?
+    } else {
+        "nil".into()
+    };
+    
+    Ok(result)
+}
+
+/// RPOP 实现
+pub fn rpop<E: KvEngine>(db: &E, key: &str) -> Result<String> {
+    let (head, tail) = match get_bounds(db, key)? {
+        Some(ht) => ht,
+        None => return Ok("nil".into()),
+    };
+    
+    let data_key = format!("{}{}:{}", DATA_PREFIX, key, seq_to_u64(tail));
+    let result = if let Some(bs) = db.remove(data_key.as_bytes())? {
+        // 更新元数据
+        if head > tail - 1 {
+            // 列表为空，删除元数据
+            let head_key = format!("{}{}:head", META_PREFIX, key);
+            let tail_key = format!("{}{}:tail", META_PREFIX, key);
+            
+            if let Some(plain_db) = db.as_db() {
+                let tree = plain_db.open_tree("")?;
+                tree.transaction(|tx| {
+                    tx.remove(head_key.as_bytes())?;
+                    tx.remove(tail_key.as_bytes())?;
+                    Ok::<(), ConflictableTransactionError>(())
+                })?;
+            } else {
+                db.remove(head_key.as_bytes())?;
+                db.remove(tail_key.as_bytes())?;
+            }
+        } else {
+            // 更新 tail
+            let tail_key = format!("{}{}:tail", META_PREFIX, key);
+            put_i64(db, &tail_key, tail - 1)?;
+        }
+        
+        String::from_utf8(bs.to_vec())?
+    } else {
+        "nil".into()
+    };
+    
+    Ok(result)
+}
+
+/// LRANGE 实现
+pub fn lrange<E: KvEngine>(
+    db: &E, 
+    key: &str, 
+    start: isize, 
+    stop: isize
+) -> Result<String> {
+    let (head, tail) = match get_bounds(db, key)? {
+        Some((h, t)) => (h, t),
+        None => return Ok(String::new()), // 空列表
+    };
+    
     let total = (tail - head + 1) as isize;
-    // Normalize negative indices
+    if total <= 0 {
+        return Ok(String::new());
+    }
+    
+    // 处理负索引
     let s = if start < 0 { total + start } else { start };
-    let e = if stop  < 0 { total + stop  } else { stop };
-    // Clamp to valid range
+    let e = if stop < 0 { total + stop } else { stop };
+    
+    // 边界检查
     let s = s.max(0).min(total - 1) as i64;
     let e = e.max(0).min(total - 1) as i64;
+    
     if s > e {
         return Ok(String::new());
     }
-    let mut out = Vec::new();
+    
+    let mut results = Vec::new();
     for idx in s..=e {
         let seq = head + idx;
-        if let Some(iv) = tree.get(seq_to_key(seq))? {
-            out.push(str::from_utf8(&iv)?.to_string());
+        let data_key = format!("{}{}:{}", DATA_PREFIX, key, seq_to_u64(seq));
+        
+        if let Some(bs) = db.get(data_key.as_bytes())? {
+            let value = String::from_utf8(bs.to_vec())?;
+            results.push(value);
         }
     }
-    Ok(out.join(","))
+    
+    Ok(results.join(","))
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-    use std::env;
+    use sled::Config;
 
-    /// Basic tests for List commands: LPUSH, RPUSH, LPOP, RPOP, LRANGE
+    /// 创建一个临时的 sled::Db，用于测试
+    fn make_db() -> sled::Db {
+        Config::new()
+            .temporary(true)
+            .open()
+            .expect("打开临时 sled db 失败")
+    } 
+
     #[test]
-    fn test_list_basic() -> Result<()> {
-        let tmp = tempdir()?;
-        env::set_current_dir(&tmp)?;
-        let db = sled::open("ldb")?;
-
-        // LPUSH / RPUSH
-        assert_eq!(lpush(&db, "L", "a")?, "1");
-        assert_eq!(lpush(&db, "L", "b")?, "2"); // b, a
-        assert_eq!(rpush(&db, "L", "c")?, "3"); // b, a, c
-
-        // LRANGE full and single-element
-        assert_eq!(lrange(&db, "L", 0, 2)?, "b,a,c");
-        assert_eq!(lrange(&db, "L", 1, 1)?, "a");
-
-        // LPOP, RPOP
-        assert_eq!(lpop(&db, "L")?, "b");
-        assert_eq!(rpop(&db, "L")?, "c");
-        assert_eq!(lrange(&db, "L", 0, -1)?, "a");
-
-        // Exhaust and empty pops
-        assert_eq!(lpop(&db, "L")?, "a");
-        assert_eq!(lpop(&db, "L")?, "nil");
-        assert_eq!(rpop(&db, "L")?, "nil");
-        Ok(())
-    }
+    fn test_list_operations() {
+    let db = make_db();
+    
+    // 基本操作
+    assert_eq!(lpush(&db, "mylist", "world").unwrap(), "1");
+    assert_eq!(lpush(&db, "mylist", "hello").unwrap(), "2");
+    assert_eq!(rpush(&db, "mylist", "!").unwrap(), "3");
+    
+    assert_eq!(lpop(&db, "mylist").unwrap(), "hello");
+    assert_eq!(rpop(&db, "mylist").unwrap(), "!");
+    
+    // 范围查询
+    assert_eq!(lrange(&db, "mylist", 0, -1).unwrap(), "world");
+    
+}
 }

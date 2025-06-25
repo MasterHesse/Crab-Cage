@@ -49,6 +49,15 @@ impl TxnSession {
             Ok(std::mem::take(&mut self.queue))
         }
     }
+
+    /// 获取当前队列中的命令（不改变状态）
+    pub fn get_queued_commands(&self) -> Option<Vec<String>> {
+        if !self.in_multi || self.queue.is_empty() {
+            return None;
+        }
+        
+        Some(self.queue.iter().map(|parts| parts.join(" ")).collect())
+    }
 }
 
 
@@ -56,6 +65,9 @@ impl TxnSession {
 mod tests {
     use super::*;
 
+    // 测试初始化
+    // 是否初始为 事务状态
+    // 是否初始为 空执行队列
     #[test]
     fn test_new() {
         let session = TxnSession::new();
@@ -63,6 +75,10 @@ mod tests {
         assert!(session.queue.is_empty());
     }
 
+    // 测试 begin()
+    // 调用 begin ，返回 OK
+    // 进入事务状态
+    // 执行队列为空
     #[test]
     fn test_begin_success() {
         let mut session = TxnSession::new();
@@ -71,6 +87,9 @@ mod tests {
         assert!(session.queue.is_empty());
     }
 
+    // 测试 begin
+    // 调用 begin ，返回 OK
+    // 再调用 begin ，返回错误（已经在事务中）
     #[test]
     fn test_begin_nested_failure() {
         let mut session = TxnSession::new();
@@ -82,6 +101,9 @@ mod tests {
         assert!(session.in_multi); // 状态应保持不变
     }
 
+    // 测试执行队列
+    // 调用 begin 后
+    // cmd 命令 是否正常入队
     #[test]
     fn test_enqueue_success() {
         let mut session = TxnSession::new();
@@ -91,6 +113,9 @@ mod tests {
         assert_eq!(session.queue, vec![cmd]);
     }
 
+    // 测试执行队列
+    // 未调用 begin
+    // 命令无法入队
     #[test]
     fn test_enqueue_failure_not_in_multi() {
         let mut session = TxnSession::new();
@@ -99,6 +124,8 @@ mod tests {
         assert!(session.queue.is_empty());
     }
 
+    // 测试 DISCARD 策略
+    // 调用 DISCARD 后，事务状态变成 false，执行队列为空
     #[test]
     fn test_discard_success() {
         let mut session = TxnSession::new();
@@ -109,6 +136,8 @@ mod tests {
         assert!(session.queue.is_empty());
     }
 
+    // 测试 DISCARD 策略
+    // 未开启事务，无法调用 DISCARD
     #[test]
     fn test_discard_failure_not_in_multi() {
         let mut session = TxnSession::new();
@@ -116,6 +145,7 @@ mod tests {
         assert!(!session.in_multi);
     }
 
+    // 输出执行队列，关闭事务状态
     #[test]
     fn test_take_queue_success() {
         let mut session = TxnSession::new();
@@ -131,6 +161,7 @@ mod tests {
         assert!(session.queue.is_empty());
     }
 
+    // 未开启事务，无法输出执行队列
     #[test]
     fn test_take_queue_failure_not_in_multi() {
         let mut session = TxnSession::new();
@@ -141,6 +172,7 @@ mod tests {
         assert!(!session.in_multi);
     }
 
+    // 输出执行队列后，可重新开启事务
     #[test]
     fn test_sequence_operations() {
         let mut session = TxnSession::new();

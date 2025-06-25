@@ -11,9 +11,10 @@ use std::io::ErrorKind;
 use tokio::{
     net::{TcpListener, TcpStream},
     io::{AsyncReadExt, AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::Mutex,
 };
 use sled::Db;
-use crate::{engine, persistence::Persistence};
+use crate::{engine, persistence::Persistence, txn::session::TxnSession};
 
 /// 按指定地址启动服务
 pub async fn start_with_addr_db_and_pers(
@@ -49,6 +50,9 @@ async fn handle_connection(
     let peer = stream.peer_addr()?;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
+
+    // 每个连接创建一个单独的事务会话
+    let txn_session = Arc::new(Mutex::new(TxnSession::new()));
 
     loop {
         // 1) 读第一个字节以区分 RESP vs 文本
@@ -107,13 +111,35 @@ async fn handle_connection(
 
         // 3) 调度到 engine
         let cmd_name = parts[0].to_uppercase();
-        let is_write = matches!(cmd_name.as_str(), "SET" | "DEL" /*| ...*/);
+        let is_write = matches!(cmd_name.as_str(), 
+            // string
+            "SET" | "DEL" | "GET" | "INCR" | "DECR" |
+            "HSET" | "HGET" | "HDEL" | "HKEYS" | "HVALS" | "HGETALL" |
+            "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LRANGE" |
+            "SADD" | "SREM" | "SMEMBERS" | "SISMEMBER" |
+            "EXPIRE" | "TTL" | "PERSIST" |
+            "MULTI" | "EXEC" | "DISCARD" |
+            "PING" | "QUIT"
+         );
         let raw = parts.join(" ");
-        let resp = engine::execute(parts, &db);
+        // 事务会话锁
+        let mut session = txn_session.lock().await;
+        let resp = engine::execute(parts.clone(), &db, &mut session);
 
         // 4) 写命令时追加 AOF & 触发快照
+        // 注意：事务中的命令只在 EXEC 时持久化
         if is_write {
-            pers.append_aof_and_maybe_snapshot(&raw, &db);
+            if cmd_name == "EXEC" {
+                // 对于 EXEC 命令，持久化整个事务队列
+                if let Some(cmds) = session.get_queued_commands() {
+                    for cmd in cmds {
+                        pers.append_aof_and_maybe_snapshot(&cmd, &db);
+                    }
+                }
+            } else if !session.in_multi {
+                // 非事务模式下的写命令直接持久化
+                pers.append_aof_and_maybe_snapshot(&raw, &db);
+            }
         }
 
         // 5) 用 RESP SimpleString / Error 回复
