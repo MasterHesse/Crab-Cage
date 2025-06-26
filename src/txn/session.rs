@@ -3,13 +3,14 @@
 /// 保存单个连接的 MULTI 队列状态
 #[derive(Debug)]
 pub struct TxnSession {
+    pub id: u64,
     pub in_multi: bool,
     pub queue: Vec<Vec<String>>,
 }
 
 impl TxnSession {
-    pub fn new() -> Self {
-        TxnSession { in_multi: false, queue: Vec::new() }
+    pub fn new(id: u64) -> Self {
+        TxnSession { id, in_multi: false, queue: Vec::new() }
     }
 
     pub fn begin(&mut self) -> Result<&'static str, &'static str> {
@@ -70,7 +71,7 @@ mod tests {
     // 是否初始为 空执行队列
     #[test]
     fn test_new() {
-        let session = TxnSession::new();
+        let session = TxnSession::new(16);
         assert!(!session.in_multi);
         assert!(session.queue.is_empty());
     }
@@ -81,7 +82,7 @@ mod tests {
     // 执行队列为空
     #[test]
     fn test_begin_success() {
-        let mut session = TxnSession::new();
+        let mut session = TxnSession::new(16);
         assert_eq!(session.begin(), Ok("OK"));
         assert!(session.in_multi);
         assert!(session.queue.is_empty());
@@ -92,7 +93,7 @@ mod tests {
     // 再调用 begin ，返回错误（已经在事务中）
     #[test]
     fn test_begin_nested_failure() {
-        let mut session = TxnSession::new();
+        let mut session = TxnSession::new(16);
         assert_eq!(session.begin(), Ok("OK"));
         assert_eq!(
             session.begin(),
@@ -106,7 +107,7 @@ mod tests {
     // cmd 命令 是否正常入队
     #[test]
     fn test_enqueue_success() {
-        let mut session = TxnSession::new();
+        let mut session = TxnSession::new(16);
         session.begin().unwrap();
         let cmd = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
         assert_eq!(session.enqueue(cmd.clone()), Ok("QUEUED"));
@@ -118,7 +119,7 @@ mod tests {
     // 命令无法入队
     #[test]
     fn test_enqueue_failure_not_in_multi() {
-        let mut session = TxnSession::new();
+        let mut session = TxnSession::new(16);
         let cmd = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
         assert_eq!(session.enqueue(cmd), Err(()));
         assert!(session.queue.is_empty());
@@ -128,7 +129,7 @@ mod tests {
     // 调用 DISCARD 后，事务状态变成 false，执行队列为空
     #[test]
     fn test_discard_success() {
-        let mut session = TxnSession::new();
+        let mut session = TxnSession::new(16);
         session.begin().unwrap();
         session.enqueue(vec!["CMD".to_string()]).unwrap();
         assert_eq!(session.discard(), Ok("OK"));
@@ -140,7 +141,7 @@ mod tests {
     // 未开启事务，无法调用 DISCARD
     #[test]
     fn test_discard_failure_not_in_multi() {
-        let mut session = TxnSession::new();
+        let mut session = TxnSession::new(16);
         assert_eq!(session.discard(), Err("ERR DISCARD without MULTI"));
         assert!(!session.in_multi);
     }
@@ -148,7 +149,7 @@ mod tests {
     // 输出执行队列，关闭事务状态
     #[test]
     fn test_take_queue_success() {
-        let mut session = TxnSession::new();
+        let mut session = TxnSession::new(16);
         session.begin().unwrap();
         let cmd1 = vec!["CMD1".to_string()];
         let cmd2 = vec!["CMD2".to_string()];
@@ -164,7 +165,7 @@ mod tests {
     // 未开启事务，无法输出执行队列
     #[test]
     fn test_take_queue_failure_not_in_multi() {
-        let mut session = TxnSession::new();
+        let mut session = TxnSession::new(16);
         assert_eq!(
             session.take_queue(),
             Err("ERR EXEC without MULTI")
@@ -175,7 +176,7 @@ mod tests {
     // 输出执行队列后，可重新开启事务
     #[test]
     fn test_sequence_operations() {
-        let mut session = TxnSession::new();
+        let mut session = TxnSession::new(16);
         
         // 开始事务
         assert_eq!(session.begin(), Ok("OK"));

@@ -6,28 +6,43 @@
 //! - 写命令时同步到持久化器  
 //! - 以 RESP Simple String/Error 形式回复
 use anyhow::Result;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering}
+};
 use std::io::ErrorKind;
 use tokio::{
     net::{TcpListener, TcpStream},
-    io::{AsyncReadExt, AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::Mutex,
+    io::{AsyncReadExt, AsyncBufReadExt, AsyncWriteExt, BufReader}
 };
-use sled::Db;
 use crate::{engine, persistence::Persistence, txn::session::TxnSession};
+use crate::engine::KvEngine;
 
 /// 按指定地址启动服务
-pub async fn start_with_addr_db_and_pers(
+pub async fn start_with_addr_db_and_pers<E>(
     addr: &str,
-    db: Db,
+    db: E,
     pers: Arc<Persistence>,
-) -> Result<()> {
+) -> Result<()> 
+where 
+    E: KvEngine + Send + Sync + 'static + Clone,
+{
     let listener = TcpListener::bind(addr).await?;
-    println!("Rudis server listening on {}", addr);
+    println!("Carb-Cage server listening on {}", addr);
     serve_with_db(listener, db, pers).await
 }
 
-async fn serve_with_db(listener: TcpListener, db: Db, pers: Arc<Persistence>) -> Result<()> {
+async fn serve_with_db<E>(
+    listener: TcpListener, 
+    db: E, 
+    pers: Arc<Persistence>
+) -> Result<()> 
+where 
+    E: KvEngine + Send + Sync +'static + Clone,
+{
+    // Sesson ID 计数器
+    static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
     loop {
         let (stream, peer) = listener.accept().await?;
         println!("Accepted connection from {}", peer);
@@ -35,24 +50,36 @@ async fn serve_with_db(listener: TcpListener, db: Db, pers: Arc<Persistence>) ->
         let db = db.clone();
         let pers = pers.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, db, pers).await {
+            if let Err(e) = 
+                handle_connection(
+                    stream, 
+                    db, 
+                    pers,
+                    SESSION_COUNTER
+                        .fetch_add(1, Ordering::SeqCst))
+                        .await 
+            {
                 eprintln!("Connection error: {}", e);
             }
         });
     }
 }
 
-async fn handle_connection(
+async fn handle_connection<E>(
     stream: TcpStream,
-    db: Db,
+    db: E,
     pers: Arc<Persistence>,
-) -> Result<()> {
+    session_id: u64,
+) -> Result<()> 
+where 
+    E: KvEngine + Send + Sync + 'static,
+{
     let peer = stream.peer_addr()?;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
     // 每个连接创建一个单独的事务会话
-    let txn_session = Arc::new(Mutex::new(TxnSession::new()));
+    let mut txn_session = TxnSession::new(session_id);
 
     loop {
         // 1) 读第一个字节以区分 RESP vs 文本
@@ -62,6 +89,12 @@ async fn handle_connection(
             Err(e) if e.kind() == ErrorKind::UnexpectedEof
                      || e.kind() == ErrorKind::ConnectionReset => {
                 println!("{} disconnected", peer);
+
+                // 断开前，清理监视
+                if let Some(watch_manager) = db.watch_manager() {
+                    watch_manager.clear_session(session_id);
+                }
+
                 break;
             }
             Err(e) => return Err(e.into()),
@@ -119,26 +152,25 @@ async fn handle_connection(
             "SADD" | "SREM" | "SMEMBERS" | "SISMEMBER" |
             "EXPIRE" | "TTL" | "PERSIST" |
             "MULTI" | "EXEC" | "DISCARD" |
+            "WATCH" | "UNWATCH" |
             "PING" | "QUIT"
          );
         let raw = parts.join(" ");
-        // 事务会话锁
-        let mut session = txn_session.lock().await;
-        let resp = engine::execute(parts.clone(), &db, &mut session);
+        let resp = engine::execute(parts.clone(), &db, &mut txn_session);
 
         // 4) 写命令时追加 AOF & 触发快照
         // 注意：事务中的命令只在 EXEC 时持久化
         if is_write {
             if cmd_name == "EXEC" {
                 // 对于 EXEC 命令，持久化整个事务队列
-                if let Some(cmds) = session.get_queued_commands() {
+                if let Some(cmds) = txn_session.get_queued_commands() {
                     for cmd in cmds {
-                        pers.append_aof_and_maybe_snapshot(&cmd, &db);
+                        pers.append_aof_and_maybe_snapshot(&cmd, &db.as_db().unwrap());
                     }
                 }
-            } else if !session.in_multi {
+            } else if !txn_session.in_multi {
                 // 非事务模式下的写命令直接持久化
-                pers.append_aof_and_maybe_snapshot(&raw, &db);
+                pers.append_aof_and_maybe_snapshot(&raw, &db.as_db().unwrap());
             }
         }
 

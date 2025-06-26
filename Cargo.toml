@@ -1,6 +1,6 @@
 [package]
 name = "crab-cage"
-version = "0.1.0"
+version = "0.6.3"
 edition = "2024"
 
 [dependencies]
@@ -12,3 +12,11 @@ serde_json = "1.0"
 hex = "0.4"
 tempfile = "3"
 clap = { version = "4.5.39", features = ["derive"] }
+dashmap = "6.1.0"
+
+[profile.release]
+opt-level = 'z'  # 优化大小而非速度
+lto = true       # 链接时优化
+codegen-units = 1 # 减少并行代码生成单元以提高优化
+panic = 'abort'  # 不生成 panic 处理代码
+strip = true     # 去除符号信息

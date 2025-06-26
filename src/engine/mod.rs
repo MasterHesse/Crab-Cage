@@ -9,6 +9,7 @@
 //! - 返回一个响应 `String`，网络层将将其格式化为 RESP 简单字符串或错误。
 pub mod kv;
 pub use kv::KvEngine;
+pub mod watch;
 
 use crate::txn::session::TxnSession;
 use crate::txn::executor::exec_all;
@@ -48,15 +49,56 @@ where
 
     // 3. 处理事务命令
     match cmd.as_str() {
+        // WATCH/UNWATCH 处理
+        "WATCH" => {
+            if txn_session.in_multi {
+                return "ERR WATCH inside MULTI is not allowed".to_string();
+            }
+
+            if parts.len() < 2 {
+                return "ERR wrong number of arguments for 'WATCH'".to_string();
+            }
+
+            let keys = &parts[1..];
+            if let Some(watch_manager) = db.watch_manager() {
+                watch_manager.watch(txn_session.id, keys);
+                return "OK".to_string();
+            }
+
+            "ERR watch manager not available".to_string()
+        }
+
+        "UNWATCH" => {
+            if let Some(watch_manager) = db.watch_manager() {
+                watch_manager.unwatch(txn_session.id);
+                return "OK".to_string();
+            }
+
+            "ERR watch manager not available".to_string()
+        }
+
         // --- 事务命令 ---
         "MULTI" => {
             txn_session.begin().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string())
         }
         "EXEC" => {
+            if let Some(watch_manager) = db.watch_manager() {
+                if watch_manager.is_dirty(txn_session.id) {
+                    watch_manager.clear_session(txn_session.id);
+                    txn_session.in_multi = false;
+                    txn_session.queue.clear();
+                    return "nil".to_string();
+                }
+            }
+
             match txn_session.take_queue() {
                 Ok(queue) => {
                     if let Some(sled_db) = db.as_db() {
                         let results = exec_all(sled_db, &queue);
+                        if let Some(watch_manager) = db.watch_manager() {
+                            watch_manager.clear_session(txn_session.id);
+                        }
+                        
                         results.join("\n")
                     } else {
                         "ERR transaction not supported".to_string()
@@ -66,7 +108,14 @@ where
             }
         }
         "DISCARD" => {
-            txn_session.discard().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string())
+            let res = txn_session.discard().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+        
+            // 清除监视
+            if let Some(watch_manager) = db.watch_manager() {
+                watch_manager.clear_session(txn_session.id);
+            }
+
+            res
         }
         
         // --- 其他命令 ---
@@ -335,7 +384,7 @@ mod tests {
 
     // 创建临时数据库和事务会话
     fn make_db_and_session() -> (sled::Db, TxnSession) {
-        (make_db(), TxnSession::new())
+        (make_db(), TxnSession::new(16))
     }
 
     // 新增事务测试

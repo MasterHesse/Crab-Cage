@@ -1,6 +1,7 @@
 use clap::Parser;
 use anyhow::Result;
 use tokio::signal;
+use std::sync::Arc;
 
 mod config;
 mod persistence;
@@ -51,20 +52,29 @@ async fn main() -> Result<()> {
     println!("Loaded config: {:?}", cfg);
 
     // 3. 打开 sled
-    let db: Db = sled::open(&args.db_path)?;
+    let sled_db: Db = sled::open(&args.db_path)?;
 
-    // 4. 构造持久化器 (支持自定义路径)
+    // 4. 创建监视管理器
+    let watch_manager = Arc::new(engine::watch::WatchManager::new());
+    
+    // 5. 创建数据库实例
+    let db = engine::kv::DbInstance{
+        db: sled_db.clone(),
+        watch_manager: watch_manager.clone(),
+    };
+
+    // 6. 构造持久化器 (支持自定义路径)
     let pers = Persistence::new_with_paths(
         cfg.clone(),
-        db.clone(),
+        sled_db.clone(),
         args.aof_path.clone(),
         args.rdb_path.clone(),
     )?;
 
-    // 5. 启动前重放 AOF
+    // 7. 启动前重放 AOF
     pers.load_aof()?;
 
-    // 6. 启动网络服务
+    // 8. 启动网络服务
     let serve_handle = {
         let db = db.clone();
         let pers = pers.clone();
@@ -76,7 +86,7 @@ async fn main() -> Result<()> {
         })
     };
 
-    // 7. 等 CTRL-C 优雅退出
+    // 9. 等 CTRL-C 优雅退出
     signal::ctrl_c().await?;
     println!("Shutting down…");
     serve_handle.abort();

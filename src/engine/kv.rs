@@ -1,8 +1,12 @@
 // src/engine/kv.rs
 
+use std::sync::Arc;
+
 use anyhow::Error;
 use sled::{Db, IVec};
 use sled::transaction::TransactionalTree;
+
+use crate::engine::watch::WatchManager;
 
 /// 统一普通 Db 与事务上下文的最小 KV 抽象
 pub trait KvEngine {
@@ -19,6 +23,12 @@ pub trait KvEngine {
     fn as_db(&self) -> Option<&Db> {
         None
     }
+
+    // 获取底层数据库引用 （用于 WATCH/UNWATCH 机制）
+    fn watch_manager(&self) -> Option<Arc<WatchManager>> {
+        None
+    }
+
 }
 
 impl KvEngine for Db {
@@ -38,6 +48,10 @@ impl KvEngine for Db {
 
     fn as_db(&self) -> Option<&Db> {
         Some(self)
+    }
+
+    fn watch_manager(&self) -> Option<Arc<WatchManager>> {
+        None
     }
 }
 
@@ -59,5 +73,48 @@ impl KvEngine for TransactionalTree {
 
     fn as_db(&self) -> Option<&Db> {
         None
+    }
+
+    fn watch_manager(&self) -> Option<Arc<WatchManager>> {
+        None
+    }
+}
+
+/// 数据库实例，包含 sled 数据库和监视管理器
+#[derive(Clone)]
+pub struct DbInstance {
+    pub db: sled::Db,
+    pub watch_manager: Arc<WatchManager>,
+}
+
+impl KvEngine for DbInstance {
+    fn get(&self, key: &[u8]) -> Result<Option<IVec>, Error> {
+        self.db.get(key).map_err(Into::into)
+    }
+    
+    fn insert(&self, key: &[u8], value: &[u8]) -> Result<Option<IVec>, Error> {
+        let res = self.db.insert(key, value)?;
+        let key_str = String::from_utf8_lossy(key);
+        self.watch_manager.notify_key_change(&key_str);
+        Ok(res)
+    }
+    
+    fn remove(&self, key: &[u8]) -> Result<Option<IVec>, Error> {
+        let res = self.db.remove(key)?;
+        let key_str = String::from_utf8_lossy(key);
+        self.watch_manager.notify_key_change(&key_str);
+        Ok(res)
+    }
+    
+    fn scan_prefix(&self, prefix: &[u8]) -> Box<dyn Iterator<Item = Result<(IVec, IVec), Error>>> {
+        Box::new(self.db.scan_prefix(prefix).map(|res| res.map_err(Into::into)))
+    }
+    
+    fn as_db(&self) -> Option<&Db> {
+        Some(&self.db)
+    }
+    
+    fn watch_manager(&self) -> Option<Arc<WatchManager>> {
+        Some(self.watch_manager.clone())
     }
 }

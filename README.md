@@ -25,6 +25,7 @@
       - [Set 数据类型操作](#set-数据类型操作)
       - [过期策略](#过期策略)
       - [事务支持](#事务支持)
+      - [乐观锁](#乐观锁)
   - [命令支持一览](#命令支持一览)
   - [贡献](#贡献)
   - [许可证](#许可证)
@@ -59,28 +60,29 @@ D:.
 |   README.md
 |   rustfmt.toml
 \---src
-    |   config.rs
-    |   expire.rs
-    |   lib.rs
-    |   main.rs
-    |   persistence.rs
-    |   server.rs
+    |   config.rs # 配置模块
+    |   expire.rs # 过期策略
+    |   lib.rs # 库
+    |   main.rs # 主程序
+    |   persistence.rs # 持久化模块
+    |   server.rs # 服务模块
     |
     +---engine
-    |       kv.rs
-    |       mod.rs
+    |       kv.rs # 统一普通 Db 与事务上下文的最小 KV 抽象
+    |       mod.rs # 引擎模块，接受命令并且调用子模块
+    |       watch.rs # WATCH 机制
     |
     +---txn
-    |       executor.rs
+    |       executor.rs # 事务执行器
     |       mod.rs
-    |       session.rs
+    |       session.rs # 事务会话模块
     |
     \---types
-            hash.rs
-            list.rs
-            mod.rs
-            set.rs
-            string.rs
+            hash.rs # 哈希类型支持
+            list.rs # 列表类型支持
+            mod.rs 
+            set.rs # 集合类型支持
+            string.rs # 基础字符类型支持
 ```
 
 ---
@@ -98,6 +100,7 @@ D:.
 - 持久化：AOF（Append-Only File）与 RDB（快照）  
 - 事务支持：
   - 基础事务操作：`MULTI`, `DISCARD`, `EXEC`
+  - 乐观锁操作：`WATCH`,`UNWATCH`
   - 支持失败回滚 
 
 ---
@@ -149,6 +152,8 @@ OK
 10
 ```
 
+---
+
 #### Hash 数据类型操作
 ```bash
 # --- Hash ---
@@ -165,6 +170,8 @@ age,name
 127.0.0.1:6380> HGETALL profile
 age,30,name,Alice
 ```
+
+---
 
 #### List 数据类型操作
 ```bash
@@ -183,6 +190,8 @@ b
 c
 ```
 
+---
+
 #### Set 数据类型操作
 ```bash
 # --- Set ---
@@ -200,6 +209,8 @@ x,y
 1
 ```
 
+---
+
 #### 过期策略
 ```bash
 # --- 过期策略 ---
@@ -216,6 +227,8 @@ OK
 127.0.0.1:6380> TTL temp
 -1
 ```
+
+---
 
 #### 事务支持
 ```bash
@@ -242,6 +255,37 @@ YOU
 ```
 ---
 
+#### 乐观锁
+客户端 1
+```bash
+redis-cli -p 6380
+
+127.0.0.1:6380> SET balance 100
+OK
+127.0.0.1:6380> WATCH balance
+OK
+127.0.0.1:6380> MULTI
+OK
+127.0.0.1:6380> INCR balance
+QUEUED
+```
+
+客户端 2
+```bash
+redis-cli -p 6380
+
+127.0.0.1:6380> INCR balance
+101
+```
+
+客户端 1
+```bash
+127.0.0.1:6380> EXEC
+nil  # 监视的key改变，事务执行失败
+```
+
+---
+
 ## 命令支持一览
 
 | 类型   | 命令                                      |
@@ -252,6 +296,8 @@ YOU
 | Set    | SADD, SREM, SMEMBERS, SISMEMBER          |
 | Expire | EXPIRE, TTL, PERSIST                     |
 | Transaction | MULTI, DISCARD, EXEC                |
+|WATCH   | WATCH, UNWATCH                           |
+|Others   | PING, QUIT                           |
 
 ---
 
@@ -264,4 +310,4 @@ YOU
 
 ## 许可证
 
-双重许可证：MIT 或 Apache-2.0，详见 [LICENSE](LICENSE) 文件。  
+双重许可证：MIT 或 Apache-2.0 
