@@ -10,13 +10,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    thread, time::Duration,
+    thread, time::{Duration, UNIX_EPOCH},
 };
 use crate::{config::Config, engine};
 
 /// 持久化器：AOF 日志 + RDB 快照
 pub struct Persistence {
-    cfg:     Config,
+    pub cfg:     Config,
     db:      Db,
     aof_path: PathBuf,
     rdb_path: PathBuf,
@@ -141,6 +141,29 @@ impl Persistence {
             if let Ok(f) = w.lock() {
                 let _ = f.sync_all();
             }
+        }
+    }
+
+    // 获取 AOF 大小
+    pub fn aof_size(&self) -> u64 {
+        if self.aof_path.exists() {
+            std::fs::metadata(&self.aof_path)
+                .map(|m| m.len())
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    // 获取最后一次 RDB 保存时间
+    pub fn last_save_time(&self) -> u64 {
+        if self.rdb_path.exists() {
+            std::fs::metadata(&self.rdb_path)
+            .and_then(|m| m.modified())
+            .map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs())
+            .unwrap_or(0)
+        } else {
+            0
         }
     }
 }

@@ -26,6 +26,7 @@
       - [过期策略](#过期策略)
       - [事务支持](#事务支持)
       - [乐观锁](#乐观锁)
+      - [监控与诊断](#监控与诊断)
   - [命令支持一览](#命令支持一览)
   - [贡献](#贡献)
   - [许可证](#许可证)
@@ -67,6 +68,13 @@ D:.
     |   persistence.rs # 持久化模块
     |   server.rs # 服务模块
     |
+    +---monitor
+    |   mod.rs
+    |   client.rs
+    |   info.rs
+    |   metrics.rs
+    |   slowlog.rs
+    |
     +---engine
     |       kv.rs # 统一普通 Db 与事务上下文的最小 KV 抽象
     |       mod.rs # 引擎模块，接受命令并且调用子模块
@@ -102,6 +110,11 @@ D:.
   - 基础事务操作：`MULTI`, `DISCARD`, `EXEC`
   - 乐观锁操作：`WATCH`,`UNWATCH`
   - 支持失败回滚 
+- 监控与诊断
+  - 获取信息：`INFO`
+  - 列出客户端信息：`CLIENT LIST`
+  - 慢日志查看：`SLOWLOG`
+- 通过 HTTP 接口获取 Prometheus 格式指标：`curl http://localhost:9090/metrics`
 
 ---
 
@@ -116,8 +129,8 @@ D:.
 ### 构建与运行
 
 ```bash
-git clone https://github.com/MasterHesse/rudis.git
-cd rudis
+git clone https://github.com/MasterHesse/Crab-Cage.git
+cd Crab-Cage
 
 # Release 模式构建并启动
 cargo build --release
@@ -283,6 +296,33 @@ redis-cli -p 6380
 127.0.0.1:6380> EXEC
 nil  # 监视的key改变，事务执行失败
 ```
+---
+
+#### 监控与诊断
+```bash
+127.0.0.1:6380> INFO
+#Server
+Crab-Cage_version:0.6.3
+OS:windows
+# Clients
+connected_clients:1
+total_connections:1
+# Memory
+used_memory:1048576 bytes
+# Persistence
+aof_enabled:1
+aof_size:715 bytes
+rdb_last_save:1750948531
+# Stats
+total_commands_processed:1
+total_keys:18
+# Command Stats
+cmd_COMMAND:1
+127.0.0.1:6380> CLIENT LIST
+id=1 addr=127.0.0.1:9403 age=70s idle=70s cmd=COMMAND
+127.0.0.1:6380> SLOWLOG
+"" # 慢命令会在此处显示，如`1. timestamp: 2023-07-01T12:00:00Z, duration: 501ms, command: XXX, client: 127.0.0.1:12345`
+```
 
 ---
 
@@ -296,8 +336,9 @@ nil  # 监视的key改变，事务执行失败
 | Set    | SADD, SREM, SMEMBERS, SISMEMBER          |
 | Expire | EXPIRE, TTL, PERSIST                     |
 | Transaction | MULTI, DISCARD, EXEC                |
-|WATCH   | WATCH, UNWATCH                           |
-|Others   | PING, QUIT                           |
+| WATCH  | WATCH, UNWATCH                           |
+| MONITOR | INFO, CLIENT LIST, SLOWLOG              |
+|Others   | PING, QUIT                              |
 
 ---
 

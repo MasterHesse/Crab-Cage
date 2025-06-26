@@ -10,11 +10,13 @@ mod engine;
 mod types;
 mod expire;
 mod txn;
+mod monitor;
 
 use config::load;
 use persistence::Persistence;
 use sled::Db;
 use std::path::PathBuf;
+use monitor::Monitor;
 
 /// crab-cage 启动参数
 #[derive(Parser, Debug)]
@@ -71,25 +73,48 @@ async fn main() -> Result<()> {
         args.rdb_path.clone(),
     )?;
 
-    // 7. 启动前重放 AOF
+    // 7. 创建监控系统
+    let monitor = Arc::new(Monitor::new());
+
+    // 8. 启动前重放 AOF
     pers.load_aof()?;
 
-    // 8. 启动网络服务
+    // 9. 启动网络服务
     let serve_handle = {
         let db = db.clone();
         let pers = pers.clone();
         let addr = args.listen.clone();
+        let monitor = monitor.clone();
         tokio::spawn(async move {
-            server::start_with_addr_db_and_pers(&addr, db, pers)
+            server::start_with_addr_db_and_pers(&addr, db, pers, monitor)
                 .await
                 .unwrap();
         })
     };
 
-    // 9. 等 CTRL-C 优雅退出
+    // 10. 启动HTTP指标服务
+    if cfg.metrics_enabled {
+        let metrics_port = cfg.metrics_port;
+        let metrics = monitor.metrics.clone();
+        tokio::spawn(async move {
+            start_metrics_server(metrics, metrics_port).await;
+        });
+    }
+
+    // 11. 等 CTRL-C 优雅退出
     signal::ctrl_c().await?;
     println!("Shutting down…");
     serve_handle.abort();
     pers.fsync_and_close();
     Ok(())
+}
+
+async fn start_metrics_server(metrics: Arc<monitor::Metrics>, port: u16) {
+    use warp::Filter;
+
+    let route = warp::path("metrics")
+        .map(move || warp::reply::html(metrics.to_prometheus()));
+
+    println!("Metrics server listening on 0.0.0.0:{}", port);
+    warp::serve(route).run(([0, 0, 0, 0], port)).await;
 }

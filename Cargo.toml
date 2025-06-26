@@ -1,6 +1,6 @@
 [package]
 name = "crab-cage"
-version = "0.6.3"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,7 @@ hex = "0.4"
 tempfile = "3"
 clap = { version = "4.5.39", features = ["derive"] }
 dashmap = "6.1.0"
+warp = "0.3.7"
 
 [profile.release]
 opt-level = 'z'  # 优化大小而非速度

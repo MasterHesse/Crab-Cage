@@ -8,3 +8,4 @@ pub mod expire;    // 过期策略
 pub mod types;     // String / Hash / List / Set / ... 数据结构
 pub mod persistence;
 pub mod txn;
+pub mod monitor;

@@ -1,6 +1,9 @@
 {
-  "aof": true,                  
-  "rdb": true,                  
-  "snapshot_interval_secs": 60, 
-  "snapshot_threshold": 1000    
+  "aof": true,
+  "rdb": true,
+  "snapshot_interval_secs": 60,
+  "snapshot_threshold": 20,
+  "metrics_enabled": true,
+  "metrics_port": 9090,
+  "slowlog_threshold_ms": 10
 }

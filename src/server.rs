@@ -6,10 +6,9 @@
 //! - 写命令时同步到持久化器  
 //! - 以 RESP Simple String/Error 形式回复
 use anyhow::Result;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering}
-};
+use std::{sync::{
+    atomic::{AtomicU64, Ordering}, Arc
+}, time::Instant};
 use std::io::ErrorKind;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -17,25 +16,28 @@ use tokio::{
 };
 use crate::{engine, persistence::Persistence, txn::session::TxnSession};
 use crate::engine::KvEngine;
+use crate::monitor::{Monitor, info};
 
 /// 按指定地址启动服务
 pub async fn start_with_addr_db_and_pers<E>(
     addr: &str,
     db: E,
     pers: Arc<Persistence>,
+    monitor: Arc<Monitor>,
 ) -> Result<()> 
 where 
     E: KvEngine + Send + Sync + 'static + Clone,
 {
     let listener = TcpListener::bind(addr).await?;
     println!("Carb-Cage server listening on {}", addr);
-    serve_with_db(listener, db, pers).await
+    serve_with_db(listener, db, pers, monitor).await
 }
 
 async fn serve_with_db<E>(
     listener: TcpListener, 
     db: E, 
-    pers: Arc<Persistence>
+    pers: Arc<Persistence>,
+    monitor: Arc<Monitor>,
 ) -> Result<()> 
 where 
     E: KvEngine + Send + Sync +'static + Clone,
@@ -49,18 +51,32 @@ where
 
         let db = db.clone();
         let pers = pers.clone();
+        let monitor = monitor.clone();
+
+        // 注册客户端
+        let client_id = monitor.client_tracker.add_client(peer);
+        monitor.metrics.connected_clients.fetch_add(1, Ordering::Relaxed);
+        monitor.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
+        
         tokio::spawn(async move {
             if let Err(e) = 
                 handle_connection(
                     stream, 
                     db, 
                     pers,
+                    monitor.clone(),
+                    client_id,
                     SESSION_COUNTER
                         .fetch_add(1, Ordering::SeqCst))
-                        .await 
+                        .await
+                    
             {
                 eprintln!("Connection error: {}", e);
             }
+
+            // 断开连接时清理
+            monitor.client_tracker.remove_client(client_id);
+            monitor.metrics.connected_clients.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -69,6 +85,8 @@ async fn handle_connection<E>(
     stream: TcpStream,
     db: E,
     pers: Arc<Persistence>,
+    monitor: Arc<Monitor>,
+    client_id: u64,
     session_id: u64,
 ) -> Result<()> 
 where 
@@ -142,8 +160,29 @@ where
             continue;
         }
 
-        // 3) 调度到 engine
+        // 3) 处理监控命令
         let cmd_name = parts[0].to_uppercase();
+        match cmd_name.as_str() {
+            "INFO" => {
+                let section = parts.get(1).map(|s| s.as_str());
+                let response = info::build_info_response(section, &db, &pers, &monitor.metrics);
+                writer.write_all(format!("${}\r\n{}\r\n", response.len(), response).as_bytes()).await?;
+                continue;
+            }
+            "CLIENT" if parts.len() > 1 && parts[1].to_uppercase() == "LIST" => {
+                let response = monitor.client_tracker.list_clients();
+                writer.write_all(format!("${}\r\n{}\r\n", response.len(), response).as_bytes()).await?;
+                continue;
+            }
+            "SLOWLOG" => {
+                let response = monitor.slow_log.get_logs();
+                writer.write_all(format!("${}\r\n{}\r\n", response.len(), response).as_bytes()).await?;
+                continue;
+            }
+            _=>{}
+        }
+
+        // 4) 调度到 engine
         let is_write = matches!(cmd_name.as_str(), 
             // string
             "SET" | "DEL" | "GET" | "INCR" | "DECR" |
@@ -156,7 +195,15 @@ where
             "PING" | "QUIT"
          );
         let raw = parts.join(" ");
+
+        let start_time = Instant::now();
         let resp = engine::execute(parts.clone(), &db, &mut txn_session);
+        let duration = start_time.elapsed();
+
+        // 更新监控数据
+        monitor.client_tracker.update_command(client_id, &cmd_name);
+        monitor.metrics.record_command(&cmd_name);
+        monitor.slow_log.add_entry(&raw, duration, &peer.to_string());
 
         // 4) 写命令时追加 AOF & 触发快照
         // 注意：事务中的命令只在 EXEC 时持久化
