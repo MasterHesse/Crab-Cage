@@ -12,6 +12,7 @@
   - [目录](#目录)
   - [什么是 Crab-Cage?](#什么是-crab-cage)
   - [为什么开发 Crab-Cage?](#为什么开发-crab-cage)
+  - [文件架构](#文件架构)
   - [特性](#特性)
   - [快速开始](#快速开始)
     - [前提](#前提)
@@ -43,6 +44,44 @@
 - 个人基于学习的深入实践 Rust 核心特性：所有权, 借用, 异步, 零拷贝等  
 - 理解 Redis 内部实现：RESP 解析, 命令分发, 数据结构, 持久化与恢复  
 - 探索分布式缓存基础：事务与原子操作, 多实例部署  
+
+---
+
+## 文件架构
+```
+D:.
+|   .gitignore
+|   appendonly.aof
+|   Cargo.lock
+|   Cargo.toml
+|   config.json
+|   dump.rdb
+|   README.md
+|   rustfmt.toml
+\---src
+    |   config.rs
+    |   expire.rs
+    |   lib.rs
+    |   main.rs
+    |   persistence.rs
+    |   server.rs
+    |
+    +---engine
+    |       kv.rs
+    |       mod.rs
+    |
+    +---txn
+    |       executor.rs
+    |       mod.rs
+    |       session.rs
+    |
+    \---types
+            hash.rs
+            list.rs
+            mod.rs
+            set.rs
+            string.rs
+```
 
 ---
 
